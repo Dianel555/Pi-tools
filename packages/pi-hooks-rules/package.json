@@ -1,0 +1,38 @@
+{
+  "name": "pi-hooks-rules",
+  "version": "0.1.0",
+  "description": "Manage Pi tool hooks through /hooks and inject rules automatically",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension",
+    "hooks",
+    "rules"
+  ],
+  "files": [
+    "index.ts",
+    "hooks.json",
+    "hooks",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "prepublishOnly": "npm --prefix ../.. run typecheck && npm --prefix ../.. test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

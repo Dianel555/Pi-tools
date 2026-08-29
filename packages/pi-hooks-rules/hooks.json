@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "hooks": [
+    {
+      "id": "secret-guard",
+      "event": "tool_call",
+      "tools": ["bash", "powershell", "write", "edit"],
+      "command": "${node}",
+      "args": ["${hooksDir}/secret-guard.mjs"],
+      "timeoutMs": 5000,
+      "enabled": true
+    },
+    {
+      "id": "destructive-command-guard",
+      "event": "tool_call",
+      "tools": ["bash", "powershell"],
+      "command": "${node}",
+      "args": ["${hooksDir}/destructive-command-guard.mjs"],
+      "timeoutMs": 5000,
+      "enabled": true
+    },
+    {
+      "id": "syntax-format-check",
+      "event": "tool_result",
+      "tools": ["write", "edit"],
+      "command": "${node}",
+      "args": ["${hooksDir}/syntax-format-check.mjs"],
+      "timeoutMs": 10000,
+      "enabled": true
+    }
+  ]
+}
