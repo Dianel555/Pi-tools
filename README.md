@@ -7,6 +7,7 @@ A workspace for Pi extensions maintained as independently publishable packages.
 | Package | Purpose |
 |---|---|
 | [`pi-hooks-rules`](packages/pi-hooks-rules/) | Manage tool hooks through `/hooks` and inject user-configured global and trusted-project rules. |
+| [`pi-workspace-history`](packages/pi-workspace-history/) | Track workspace snapshots around agent turns and restore them with `/undo`, `/redo`, `/checkpoint`, and `/rewind`. |
 
 ## Development
 
