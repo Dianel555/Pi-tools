@@ -1,6 +1,6 @@
 {
   "name": "@dianel/pi-hud",
-  "version": "1.0.0",
+  "version": "1.0.0-patch",
   "description": "Pi HUD Overlay — always-on-top real-time status panel",
   "type": "module",
   "main": "./index.mjs",
@@ -9,7 +9,7 @@
       "default": "./index.mjs"
     }
   },
-  "files": ["index.mjs", "pi_hud.py", "data.py", "theme.py", "model_config.py", "view.py", "assests/*.png"],
+  "files": ["index.mjs", "pi_hud.py", "data.py", "theme.py", "model_config.py", "view.py", "assets/*.png"],
   "pi": {
     "extensions": ["./index.mjs"]
   },

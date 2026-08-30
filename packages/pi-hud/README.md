@@ -96,11 +96,11 @@ When an assistant usage record omits `totalTokens`, the HUD derives it from `inp
 
 Right-click the HUD and open **theme** to choose **Dark**, **White**, or **Paper Beige**. The selection is saved with the window geometry and restored on the next launch.
 
-![Dark](assests/dark.png)
+![Dark](assets/dark.png)
 
-![White](assests/white.png)
+![White](assets/white.png)
 
-![Paper Beige](assests/paper beige.png)
+![Paper Beige](assets/paper beige.png)
 
 ## Data sources
 
