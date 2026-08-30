@@ -1,0 +1,19 @@
+{
+  "name": "pi-hud",
+  "version": "1.0.0",
+  "description": "Pi HUD Overlay — always-on-top real-time status panel",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": {
+      "default": "./index.mjs"
+    }
+  },
+  "files": ["index.mjs", "pi_hud.py", "data.py", "theme.py", "model_config.py", "view.py"],
+  "pi": {
+    "extensions": ["./index.mjs"]
+  },
+  "keywords": ["pi", "hud", "overlay", "pi-extension"],
+  "author": "",
+  "license": "MIT"
+}

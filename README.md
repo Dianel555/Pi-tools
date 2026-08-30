@@ -8,6 +8,7 @@ A workspace for Pi extensions maintained as independently publishable packages.
 |---|---|
 | [`pi-hooks-rules`](packages/pi-hooks-rules/) | Manage tool hooks through `/hooks` and inject user-configured global and trusted-project rules. |
 | [`pi-workspace-history`](packages/pi-workspace-history/) | Track workspace snapshots around agent turns and restore them with `/undo`, `/redo`, `/checkpoint`, and `/rewind`. |
+| [`pi-hud`](packages/pi-hud/) | Always-on-top, multi-session Pi status overlay with responsive resizing. |
 
 ## Development
 
