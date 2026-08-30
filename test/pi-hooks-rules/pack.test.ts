@@ -11,7 +11,7 @@ test("npm tarball contains every runtime file and no personal rules", () => {
   assert.ok(npmCli, "npm_execpath is required");
   const result = spawnSync(
     process.execPath,
-    [npmCli, "pack", "--workspace", "pi-hooks-rules", "--dry-run", "--json", "--ignore-scripts"],
+    [npmCli, "pack", "--workspace", "@dianel/pi-hooks-rules", "--dry-run", "--json", "--ignore-scripts"],
     { cwd: repoRoot, encoding: "utf8", windowsHide: true },
   );
   assert.equal(result.status, 0, result.stderr || result.stdout);

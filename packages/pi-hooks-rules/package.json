@@ -1,5 +1,5 @@
 {
-  "name": "pi-hooks-rules",
+  "name": "@dianel/pi-hooks-rules",
   "version": "0.1.0",
   "description": "Manage Pi tool hooks through /hooks and inject rules automatically",
   "license": "MIT",

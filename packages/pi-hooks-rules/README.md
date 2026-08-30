@@ -11,7 +11,7 @@ A Pi 0.84.3+ package for Node.js 22.19+ that provides:
 ## Install
 
 ```bash
-pi install npm:pi-hooks-rules
+pi install npm:@dianel/pi-hooks-rules
 ```
 
 Restart Pi or run `/reload`, then open `/hooks`.

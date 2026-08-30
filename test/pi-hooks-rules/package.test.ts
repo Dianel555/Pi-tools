@@ -9,7 +9,7 @@ const packageRoot = join(repoRoot, "packages", "pi-hooks-rules");
 const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
 
 test("package manifest exposes one Pi extension", () => {
-  assert.equal(manifest.name, "pi-hooks-rules");
+  assert.equal(manifest.name, "@dianel/pi-hooks-rules");
   assert.equal(manifest.private, undefined);
   assert.deepEqual(manifest.pi.extensions, ["./index.ts"]);
   assert.equal(manifest.keywords.includes("pi-package"), true);
