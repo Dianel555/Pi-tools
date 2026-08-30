@@ -1,5 +1,5 @@
 {
-  "name": "pi-hud",
+  "name": "@dianel/pi-hud",
   "version": "1.0.0",
   "description": "Pi HUD Overlay — always-on-top real-time status panel",
   "type": "module",
@@ -9,11 +9,14 @@
       "default": "./index.mjs"
     }
   },
-  "files": ["index.mjs", "pi_hud.py", "data.py", "theme.py", "model_config.py", "view.py"],
+  "files": ["index.mjs", "pi_hud.py", "data.py", "theme.py", "model_config.py", "view.py", "assests/*.png"],
   "pi": {
     "extensions": ["./index.mjs"]
   },
-  "keywords": ["pi", "hud", "overlay", "pi-extension"],
+  "keywords": ["pi", "hud", "overlay", "pi-extension", "pi-package"],
   "author": "",
-  "license": "MIT"
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
 }

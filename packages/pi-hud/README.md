@@ -18,7 +18,7 @@ Always-on-top real-time status overlay for [Pi](https://github.com/earendil-work
 ## Install
 
 ```bash
-pi install npm:pi-hud
+pi install npm:@dianel/pi-hud
 ```
 
 After installation, restart Pi. The HUD window appears in the top-left corner.
@@ -95,6 +95,12 @@ When an assistant usage record omits `totalTokens`, the HUD derives it from `inp
 ## Themes
 
 Right-click the HUD and open **theme** to choose **Dark**, **White**, or **Paper Beige**. The selection is saved with the window geometry and restored on the next launch.
+
+![Dark](assests/dark.png)
+
+![White](assests/white.png)
+
+![Paper Beige](assests/paper beige.png)
 
 ## Data sources
 
