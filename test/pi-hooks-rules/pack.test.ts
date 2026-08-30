@@ -23,6 +23,7 @@ test("npm tarball contains every runtime file and no personal rules", () => {
     "hooks/secret-guard.mjs",
     "hooks/destructive-command-guard.mjs",
     "hooks/syntax-format-check.mjs",
+    "assets/demo.png",
     "README.md",
     "LICENSE",
     "package.json",

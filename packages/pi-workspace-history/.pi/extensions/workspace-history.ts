@@ -23,9 +23,14 @@ import {
   cp,
 } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
-import ignore, { type Ignore } from "ignore";
+import { type Ignore } from "ignore";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import path from "node:path";
+
+const ignore: typeof import("ignore").default = createRequire(import.meta.url)(
+  "ignore",
+);
 
 const SNAPSHOT_TYPE = "workspace-history.snapshot";
 
@@ -2918,7 +2923,6 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
   pi.registerCommand("rewind", {
     description: "Browse history like /tree, then restore files",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
-      await ctx.waitForIdle();
       const state = getState(ctx);
       if (!(await ensureWorkspaceHistoryAvailable(ctx, state, "rewind"))) {
         return;
@@ -2927,6 +2931,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       // Direct entry-id: skip picker
       const directId = args?.trim();
       if (directId) {
+        await ctx.waitForIdle();
         const targetId = directId;
         const snapshot = resolveSnapshotForTreeTarget(ctx, targetId, state);
         const snapshotData = getResolvedSnapshotData(snapshot);
@@ -2958,7 +2963,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
             (targetId) => done({ targetId }),
             () => done(undefined),
             (entryId, label) => {
-              ctx.sessionManager.appendLabelChange(entryId, label);
+              pi.setLabel(entryId, label);
               tui.requestRender();
             },
           );
@@ -2986,6 +2991,8 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       if (!pickerResult) return;
       const targetId = pickerResult.targetId;
       if (!targetId) return;
+
+      await ctx.waitForIdle();
 
       const snapshot = resolveSnapshotForTreeTarget(ctx, targetId, state);
       const snapshotData = getResolvedSnapshotData(snapshot);

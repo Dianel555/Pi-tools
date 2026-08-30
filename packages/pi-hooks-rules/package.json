@@ -1,6 +1,6 @@
 {
   "name": "@dianel/pi-hooks-rules",
-  "version": "0.1.0",
+  "version": "0.1.0-patch",
   "description": "Manage Pi tool hooks through /hooks and inject rules automatically",
   "license": "MIT",
   "type": "module",
@@ -15,6 +15,7 @@
     "index.ts",
     "hooks.json",
     "hooks",
+    "assets",
     "README.md",
     "LICENSE"
   ],

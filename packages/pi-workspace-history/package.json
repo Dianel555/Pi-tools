@@ -1,16 +1,21 @@
 {
-  "name": "pi-workspace-history",
+  "name": "@dianel/pi-workspace-history",
   "version": "1.0.0",
   "description": "Real workspace undo/redo for Pi",
   "type": "module",
   "main": ".pi/extensions/workspace-history.ts",
+  "files": ["./.pi/extensions/workspace-history.ts", "README.md"],
+  "pi": {
+    "extensions": ["./.pi/extensions/workspace-history.ts"]
+  },
+  "keywords": ["pi-package", "workspace", "undo", "redo", "pi-extension"],
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.80.0"
   },
   "dependencies": {
     "ignore": "^5.3.0"
   },
-  "pi": {
-    "extensions": ["./.pi/extensions/workspace-history.ts"]
+  "publishConfig": {
+    "access": "public"
   }
 }

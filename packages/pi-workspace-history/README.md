@@ -7,7 +7,7 @@ Real workspace undo/redo for Pi. Tracks file snapshots around each agent turn so
 ## Install
 
 ```bash
-pi install npm:pi-workspace-history
+pi install npm:@dianel/pi-workspace-history
 ```
 
 ## Commands
@@ -41,6 +41,12 @@ pi install npm:pi-workspace-history
 | Ctrl+D / T / U / L / A | Cycle filter mode |
 | Enter | Confirm selection |
 | Esc | Cancel |
+
+## Preview
+
+The `/rewind` picker:
+
+![Rewind picker](assets/rewind.png)
 
 ## Configuration
 
@@ -86,7 +92,7 @@ Example:
 Install from npm after publishing:
 
 ```bash
-pi install npm:pi-workspace-history
+pi install npm:@dianel/pi-workspace-history
 ```
 
 Or install from a local checkout:
@@ -128,7 +134,7 @@ Or run individual checks:
 ```bash
 npm test
 npm run typecheck
-npm pack --workspace pi-workspace-history --dry-run
+npm pack --workspace @dianel/pi-workspace-history --dry-run
 ```
 
 ## Recent Changes
