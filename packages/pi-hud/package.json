@@ -1,21 +1,50 @@
 {
   "name": "@dianel/pi-hud",
-  "version": "1.0.0-patch",
+  "version": "1.0.1",
   "description": "Pi HUD Overlay — always-on-top real-time status panel",
-  "type": "module",
-  "main": "./index.mjs",
-  "exports": {
-    ".": {
-      "default": "./index.mjs"
-    }
+  "author": "Dianel555",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dianel555/Pi-tools.git",
+    "directory": "packages/pi-hud"
   },
-  "files": ["index.mjs", "pi_hud.py", "data.py", "theme.py", "model_config.py", "view.py", "assets/*.png"],
+  "homepage": "https://github.com/Dianel555/Pi-tools/tree/main/packages/pi-hud#readme",
+  "bugs": {
+    "url": "https://github.com/Dianel555/Pi-tools/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension",
+    "pi",
+    "hud",
+    "overlay"
+  ],
+  "files": [
+    "index.mjs",
+    "pi_hud.py",
+    "data.py",
+    "theme.py",
+    "model_config.py",
+    "view.py",
+    "assets/*.png",
+    "README.md",
+    "LICENSE"
+  ],
   "pi": {
     "extensions": ["./index.mjs"]
   },
-  "keywords": ["pi", "hud", "overlay", "pi-extension", "pi-package"],
-  "author": "",
-  "license": "MIT",
+  "scripts": {
+    "prepublishOnly": "npm --prefix ../.. run check"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
   "publishConfig": {
     "access": "public"
   }

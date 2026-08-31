@@ -11,7 +11,7 @@ dist/
 .DS_Store
 Thumbs.db
 __pycache__
-AGENTS.md
 
 #IDE FIlES
 .pi/
+AGENTS.md

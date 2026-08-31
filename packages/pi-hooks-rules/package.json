@@ -1,9 +1,22 @@
 {
   "name": "@dianel/pi-hooks-rules",
-  "version": "0.1.0-patch",
+  "version": "1.0.0",
   "description": "Manage Pi tool hooks through /hooks and inject rules automatically",
+  "author": "Dianel555",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dianel555/Pi-tools.git",
+    "directory": "packages/pi-hooks-rules"
+  },
+  "homepage": "https://github.com/Dianel555/Pi-tools/tree/main/packages/pi-hooks-rules#readme",
+  "bugs": {
+    "url": "https://github.com/Dianel555/Pi-tools/issues"
+  },
   "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "keywords": [
     "pi-package",
     "pi-coding-agent",
@@ -25,15 +38,12 @@
     ]
   },
   "scripts": {
-    "prepublishOnly": "npm --prefix ../.. run typecheck && npm --prefix ../.. test"
+    "prepublishOnly": "npm --prefix ../.. run check"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
   "publishConfig": {
     "access": "public"
-  },
-  "engines": {
-    "node": ">=22.19.0"
   }
 }
