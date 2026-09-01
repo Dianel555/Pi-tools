@@ -1,7 +1,7 @@
 {
   "name": "@dianel/pi-hud",
-  "version": "1.0.1",
-  "description": "Pi HUD Overlay — always-on-top real-time status panel",
+  "version": "1.0.2",
+  "description": "Pi Task Monitor — always-on-top real-time task panel",
   "author": "Dianel555",
   "license": "MIT",
   "repository": {

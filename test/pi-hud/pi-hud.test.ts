@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync, mkdtempSync, writeFileSync, utimesSync } from "node:fs";
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -14,6 +14,7 @@ const dataSource = readFileSync(join(packageDir, "data.py"), "utf8");
 const themeSource = readFileSync(join(packageDir, "theme.py"), "utf8");
 const modelConfigSource = readFileSync(join(packageDir, "model_config.py"), "utf8");
 const viewSource = readFileSync(join(packageDir, "view.py"), "utf8");
+const readmeSource = readFileSync(join(packageDir, "README.md"), "utf8");
 
 function runPython(code: string, env: NodeJS.ProcessEnv) {
   const result = spawnSync(process.env.PYTHON || "python", ["-c", code], {
@@ -105,6 +106,737 @@ assert cache.ctx_win_for("agentrouter", "gpt-5.6-sol") == 372000
 assert cache.ctx_win_for("duckcode", "unknown-model") == 0
 `;
   runPython(script, { ...process.env, PI_AGENT_DIR: root });
+});
+
+test("session cost separates subagent usage and async artifacts without double counting", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-subagents-"));
+  const session = join(root, "session.jsonl");
+  const asyncDir = join(root, "async-run");
+  const events = [
+    {
+      type: "message",
+      message: {
+        role: "assistant",
+        usage: { cost: { total: 1.25 } },
+      },
+    },
+    {
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "Agent",
+        usage: { cost: { total: 0.5 } },
+        details: { id: "agent-1" },
+      },
+    },
+    {
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "subagent",
+        details: { runId: "async-1", asyncDir },
+      },
+    },
+    {
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "subagent",
+        usage: { cost: { total: 0.75 } },
+        details: { runId: "async-1", asyncDir },
+      },
+    },
+    {
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "SubagentWorkflow",
+        usage: { costUsd: 0.4 },
+      },
+    },
+    {
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "unknown-subagent-tool",
+        usage: { cost: { total: 9 } },
+      },
+    },
+  ];
+  mkdirSync(asyncDir, { recursive: true });
+  writeFileSync(join(asyncDir, "status.json"), JSON.stringify({
+    runId: "async-1",
+    status: "completed",
+    totalCost: { costUsd: 0.75 },
+  }));
+  writeFileSync(session, events.map((event) => JSON.stringify(event)).join("\n") + "\n");
+
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert round(cache.cost, 2) == 10.25
+assert round(cache.subagents_cost, 2) == 1.65, cache.subagents_cost
+`;
+  runPython(script, process.env);
+});
+
+test("main cost includes Pi compaction and branch-summary usage", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-main-cost-"));
+  const session = join(root, "session.jsonl");
+  writeFileSync(
+    session,
+    [
+      { type: "message", message: { role: "assistant", usage: { cost: { total: 0.1 } } } },
+      { type: "compaction", usage: { cost: { total: 0.2 } } },
+      { type: "branch_summary", usage: { cost: { total: 0.3 } } },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
+  );
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert round(cache.cost, 2) == 0.6, cache.cost
+`;
+  runPython(script, process.env);
+});
+
+test("grouped notifications do not duplicate an aggregate Tintin usage drain", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-group-dedup-"));
+  const session = join(root, "session.jsonl");
+  writeFileSync(
+    session,
+    [
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "Agent",
+          usage: { cost: { total: 0.04483852 } },
+          details: { agentId: "group-result" },
+        },
+      },
+      {
+        type: "custom_message",
+        customType: "subagent-notification",
+        details: {
+          id: "child-a",
+          totalCost: 0.01607804,
+          others: [
+            { id: "child-b", totalCost: 0.01622604 },
+            { id: "child-c", totalCost: 0.01253444 },
+          ],
+        },
+      },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
+  );
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert round(cache.subagents_cost, 8) == 0.04483852, cache.subagents_cost
+`;
+  runPython(script, process.env);
+});
+
+test("notification cost is not duplicated when the usage result has another run id", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-mismatched-dedup-"));
+  const session = join(root, "session.jsonl");
+  writeFileSync(
+    session,
+    [
+      {
+        type: "custom_message",
+        customType: "subagent-notification",
+        details: { id: "notification-run", totalCost: 0.05374 },
+      },
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "toolCall",
+            id: "call-result",
+            name: "get_subagent_result",
+            arguments: { agent_id: "usage-run" },
+          }],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "call-result",
+          toolName: "get_subagent_result",
+          usage: { cost: { total: 0.05374 } },
+        },
+      },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
+  );
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert round(cache.subagents_cost, 8) == 0.05374, cache.subagents_cost
+`;
+  runPython(script, process.env);
+});
+
+test("reported usage supersedes a prior completion notification", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-subagent-dedup-"));
+  const session = join(root, "session.jsonl");
+  writeFileSync(
+    session,
+    [
+      {
+        type: "custom_message",
+        customType: "subagent-notification",
+        details: { id: "background-1", totalCost: 0.7 },
+      },
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "toolCall",
+            id: "call-get-result",
+            name: "get_subagent_result",
+            arguments: { agent_id: "background-1" },
+          }],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "call-get-result",
+          toolName: "get_subagent_result",
+          usage: { cost: { total: 0.7 } },
+        },
+      },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
+  );
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert round(cache.subagents_cost, 2) == 0.7, cache.subagents_cost
+`;
+  runPython(script, process.env);
+});
+
+test("partial usage does not replace a notification aggregate", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-subagent-partial-"));
+  const session = join(root, "session.jsonl");
+  writeFileSync(
+    session,
+    [
+      { type: "custom_message", customType: "subagent-notification", details: { id: "run-a", totalCost: 0.7 } },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "subagent",
+          details: { runId: "run-a" },
+          usage: { cost: { total: 0.2 } },
+        },
+      },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
+  );
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert round(cache.subagents_cost, 2) == 0.7, cache.subagents_cost
+`;
+  runPython(script, process.env);
+});
+
+test("notification fallback is not suppressed by an unrelated concurrent usage report", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-subagent-concurrent-"));
+  const session = join(root, "session.jsonl");
+  writeFileSync(
+    session,
+    [
+      { type: "custom_message", customType: "subagent-notification", details: { id: "run-a", totalCost: 0.7 } },
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "call-b", name: "get_subagent_result", arguments: { agent_id: "run-b" } }],
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "call-b",
+          toolName: "get_subagent_result",
+          usage: { cost: { total: 0.2 } },
+        },
+      },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
+  );
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert round(cache.subagents_cost, 2) == 0.9, cache.subagents_cost
+`;
+  runPython(script, process.env);
+});
+
+test("subagent detail costs work when usage reporting is disabled", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-subagent-details-"));
+  const session = join(root, "session.jsonl");
+  writeFileSync(
+    session,
+    [
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "Agent",
+          details: { agentId: "foreground-1", cost: 0.6 },
+        },
+      },
+      {
+        type: "custom_message",
+        customType: "subagent-notification",
+        details: {
+          id: "background-1",
+          totalCost: 0.7,
+          others: [{ id: "background-2", totalCost: { costUsd: 0.2 } }],
+        },
+      },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
+  );
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert round(cache.subagents_cost, 2) == 1.5, cache.subagents_cost
+`;
+  runPython(script, process.env);
+});
+
+test("lifecycle cost markers survive consumed and unreported subagents", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-subagent-ledger-"));
+  const session = join(root, "session.jsonl");
+  const asyncDir = join(root, "async-run");
+  mkdirSync(asyncDir, { recursive: true });
+  writeFileSync(join(asyncDir, "status.json"), JSON.stringify({ totalCost: { costUsd: 0.8 } }));
+  writeFileSync(
+    session,
+    [
+      { type: "custom", customType: "pi-hud:subagent-cost", data: { id: "run-a", cost: 0.8 } },
+      { type: "custom", customType: "pi-hud:subagent-cost", data: { id: "run-a", cost: 0.6 } },
+      { type: "custom", customType: "pi-hud:subagent-cost", data: { id: "run-b", cost: 0.4 } },
+      { type: "custom", customType: "pi-hud:subagent-cost", data: { id: "run-zero", cost: 0 } },
+      { type: "custom_message", customType: "subagent-notification", details: { id: "run-a", totalCost: 0.8 } },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "Agent",
+          usage: { cost: { total: 0.8 } },
+          details: { agentId: "run-a", asyncDir },
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "Agent",
+          details: { agentId: "run-zero", cost: 0.6 },
+        },
+      },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
+  );
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert round(cache.subagents_cost, 2) == 1.8, cache.subagents_cost
+`;
+  runPython(script, process.env);
+  assert.match(extensionSource, /pi\.events\.on\("subagents:completed"/);
+  assert.match(extensionSource, /pi\.events\.on\("subagents:failed"/);
+  assert.match(extensionSource, /SUBAGENT_COST_ENTRY/);
+});
+
+test("global usage drains do not double count later lifecycle markers", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-subagent-pool-"));
+  writeFileSync(
+    join(root, "session.jsonl"),
+    [
+      { type: "custom", customType: "pi-hud:subagent-cost", data: { id: "run-a", cost: 0.8 } },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "Agent",
+          usage: { cost: { total: 1.0 } },
+          details: { agentId: "run-a" },
+        },
+      },
+      { type: "custom", customType: "pi-hud:subagent-cost", data: { id: "run-b", cost: 0.2 } },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
+  );
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert round(cache.subagents_cost, 2) == 1.0, cache.subagents_cost
+`;
+  runPython(script, process.env);
+});
+
+test("resumed Tintin usage uses deltas instead of lifetime detail totals", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-subagent-resume-"));
+  writeFileSync(
+    join(root, "session.jsonl"),
+    [
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "Agent",
+          usage: { cost: { total: 0.8 } },
+          details: { agentId: "run-a", cost: 0.8 },
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "Agent",
+          usage: { cost: { total: 0.2 } },
+          details: { agentId: "run-a", cost: 0.8 },
+        },
+      },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
+  );
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert round(cache.subagents_cost, 2) == 1.0, cache.subagents_cost
+`;
+  runPython(script, process.env);
+});
+
+test("concurrent lifecycle and keyed usage costs are both counted", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-subagent-concurrent-"));
+  writeFileSync(
+    join(root, "session.jsonl"),
+    [
+      { type: "custom", customType: "pi-hud:subagent-cost", data: { id: "run-a", cost: 0.8 } },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "Agent",
+          usage: { cost: { total: 0.2 } },
+          details: { agentId: "run-b" },
+        },
+      },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
+  );
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert round(cache.subagents_cost, 2) == 1.0, cache.subagents_cost
+`;
+  runPython(script, process.env);
+});
+
+test("ownerless pool drains after a run do not hide concurrent spend", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-subagent-ownerless-pool-"));
+  writeFileSync(
+    join(root, "session.jsonl"),
+    [
+      { type: "custom", customType: "pi-hud:subagent-cost", data: { id: "run-a", cost: 0.8 } },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "Agent",
+          usage: { cost: { total: 0.8 } },
+          details: { agentId: "run-a", cost: 0.8 },
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "Agent",
+          usage: { cost: { total: 0.2 } },
+          details: { agentId: "run-a", cost: 0.8 },
+        },
+      },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
+  );
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert round(cache.subagents_cost, 2) == 1.0, cache.subagents_cost
+`;
+  runPython(script, process.env);
+});
+
+test("a large keyed pool drain reconciles known runs before residual spend", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-subagent-pool-reconcile-"));
+  writeFileSync(
+    join(root, "session.jsonl"),
+    [
+      { type: "custom", customType: "pi-hud:subagent-cost", data: { id: "run-a", cost: 0.8 } },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "get_subagent_result",
+          usage: { cost: { total: 1.0 } },
+          details: { agentId: "run-b" },
+        },
+      },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
+  );
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert round(cache.subagents_cost, 2) == 1.0, cache.subagents_cost
+`;
+  runPython(script, process.env);
+});
+
+test("nested result costs prefer the aggregate and async status files stay live", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-subagent-nested-"));
+  const session = join(root, "session.jsonl");
+  const asyncDir = join(root, "async-run");
+  mkdirSync(asyncDir, { recursive: true });
+  writeFileSync(join(asyncDir, "status.json"), JSON.stringify({
+    runId: "async-run",
+    status: "running",
+    steps: [{ usage: { cost: { total: 0.4 } } }],
+  }));
+  writeFileSync(
+    session,
+    [
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "subagent",
+          usage: { cost: { total: 0.4 } },
+          details: {
+            runId: "aggregate-run",
+            cost: 0.4,
+            totalCost: { costUsd: 0.9 },
+            results: [{ usage: { cost: { total: 0.4 } }, children: [{ totalCost: 0.5 }] }],
+          },
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "subagent",
+          details: { runId: "async-run", asyncDir },
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "subagent",
+          details: {
+            runId: "nested-run",
+            results: [{ usage: { cost: { total: 0.2 } }, children: [{ cost: 0.3 }] }],
+          },
+        },
+      },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
+  );
+  const script = `
+import json, sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+root = ${JSON.stringify(root)}
+cache = SessionCache(root, ${JSON.stringify(join(root, "models.json"))})
+assert round(cache.subagents_cost, 2) == 1.8, cache.subagents_cost
+with open(${JSON.stringify(join(asyncDir, "status.json"))}, "w", encoding="utf-8") as f:
+    json.dump({"runId": "async-run", "status": "completed", "totalCost": {"costUsd": 1.1}}, f)
+assert round(cache.subagents_cost, 2) == 2.5, cache.subagents_cost
+`;
+  runPython(script, process.env);
+});
+
+test("partial async usage is completed by its status artifact", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-subagent-async-partial-"));
+  const session = join(root, "session.jsonl");
+  const asyncDir = join(root, "async-run");
+  mkdirSync(asyncDir, { recursive: true });
+  writeFileSync(join(asyncDir, "status.json"), JSON.stringify({ totalCost: { costUsd: 0.75 } }));
+  writeFileSync(
+    session,
+    JSON.stringify({
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "subagent",
+        usage: { cost: { total: 0.2 } },
+        details: { runId: "async-run", asyncDir },
+      },
+    }) + "\n",
+  );
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert round(cache.subagents_cost, 2) == 0.75, cache.subagents_cost
+`;
+  runPython(script, process.env);
+});
+
+test("async result costs link back to the original artifact run", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-subagent-async-link-"));
+  const session = join(root, "session.jsonl");
+  const asyncDir = join(root, "async-run");
+  mkdirSync(asyncDir, { recursive: true });
+  writeFileSync(join(asyncDir, "status.json"), JSON.stringify({ totalCost: { costUsd: 0.75 } }));
+  writeFileSync(
+    session,
+    [
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "subagent",
+          details: { runId: "async-run", asyncDir },
+        },
+      },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "subagent",
+          details: { runId: "async-run", totalCost: { costUsd: 0.75 } },
+        },
+      },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
+  );
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert round(cache.subagents_cost, 2) == 0.75, cache.subagents_cost
+`;
+  runPython(script, process.env);
+});
+
+test("persisted cost markers remain visible beyond the display tail", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-subagent-history-"));
+  const session = join(root, "session.jsonl");
+  const events = [
+    { type: "custom", customType: "pi-hud:subagent-cost", data: { id: "old-run", cost: 0.85 } },
+    ...Array.from({ length: 2100 }, () => ({ type: "message", message: { role: "user", content: "keep" } })),
+  ];
+  writeFileSync(session, events.map((event) => JSON.stringify(event)).join("\n") + "\n");
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert round(cache.subagents_cost, 2) == 0.85, cache.subagents_cost
+`;
+  runPython(script, process.env);
+});
+
+test("lifecycle events determine whether the HUD is active", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-lifecycle-"));
+  const session = join(root, "session.jsonl");
+  writeFileSync(
+    session,
+    [
+      { type: "custom", customType: "pi-hud:agent-state", data: { active: true } },
+      { type: "agent_end", willRetry: true },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
+  );
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert cache.agent_active is True
+with open(${JSON.stringify(session)}, "a", encoding="utf-8") as f:
+    f.write('{"type":"custom","customType":"pi-hud:agent-state","data":{"active":false}}\\n')
+cache._mtime = 0
+assert cache.agent_active is False
+`;
+  runPython(script, process.env);
+  assert.match(viewSource, /agent_active/);
+});
+
+test("bell state, subagent cost footer, and visible name have regression guards", () => {
+  assert.match(extensionSource, /AGENT_STATE_ENTRY/);
+  assert.match(extensionSource, /pi\.appendEntry\(AGENT_STATE_ENTRY, \{ active \}\)/);
+  assert.match(pythonSource, /self\.lbl_bell = tk\.Label\(status_group, text="🔔"/);
+  assert.match(pythonSource, /BASE_FONT \+ 8/);
+  assert.match(pythonSource, /def _shake_bell\(self\):/);
+  assert.match(pythonSource, /self\.after\(140, self\._shake_bell\)/);
+  assert.match(viewSource, /agent_active/);
+  assert.doesNotMatch(viewSource, /60s/);
+  assert.match(viewSource, /_fmt_money\(cost\).*_fmt_money\(subagents_cost\)/s);
+  assert.match(viewSource, /\(subagents\)/);
+  assert.match(pythonSource, /● Pi Task Monitor/);
+  assert.match(readmeSource, /# Pi Task Monitor/);
+
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+import pi_hud
+
+class FakeLabel:
+    def __init__(self):
+        self.values = {}
+    def config(self, **kwargs):
+        self.values.update(kwargs)
+
+hud = pi_hud.HUD.__new__(pi_hud.HUD)
+hud.lbl_bell = FakeLabel()
+hud._bell_active = False
+hud._bell_frame = 0
+hud._bell_after = None
+hud.after = lambda delay, callback: (delay, callback)
+cancelled = []
+hud.after_cancel = lambda timer: cancelled.append(timer)
+pi_hud.HUD._set_bell(hud, True, "cyan")
+assert hud.lbl_bell.values["fg"] == "cyan"
+assert hud._bell_after[0] == 140
+pi_hud.HUD._set_bell(hud, False, "dim")
+assert cancelled and hud.lbl_bell.values["text"] == "🔔"
+`;
+  runPython(script, process.env);
 });
 
 test("context usage falls back to the latest usage components", () => {

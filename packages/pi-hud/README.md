@@ -1,12 +1,12 @@
-# Pi HUD
+# Pi Task Monitor
 
-Always-on-top real-time status overlay for [Pi](https://github.com/earendil-works/pi-coding-agent).
+Always-on-top real-time task monitor for [Pi](https://github.com/earendil-works/pi-coding-agent).
 
 ## Preview
 
 ```
 ┌───────────────────────────────────────────────────────────────────────┐
-│ ◀ ▶ ● Pi HUD  1/N                                         📌  —  ✕   │
+│ ◀ ▶ ● Pi Task Monitor  1/N                                📌  —  ✕   │
 ├───────────────────────────────────────────────────────────────────────┤
 │                               RUNNING                                 │
 │                   ▶ edit relative/path/to/file.py                     │
@@ -21,7 +21,7 @@ Always-on-top real-time status overlay for [Pi](https://github.com/earendil-work
 pi install npm:@dianel/pi-hud
 ```
 
-After installation, restart Pi. The HUD window appears in the top-left corner.
+After installation, restart Pi. The monitor window appears in the top-left corner.
 
 ## Features
 
@@ -31,6 +31,8 @@ After installation, restart Pi. The HUD window appears in the top-left corner.
 - **Session navigation** — ◀ ▶ buttons or keyboard shortcuts to browse sessions
 - **Responsive layout** — footer switches between one and two rows; horizontal resizing preserves the current UI scale, while vertical resizing keeps status and command content centered
 - **Context visibility** — resolves the active model's context window from Pi's custom and built-in model catalogs
+- **Task activity** — shows a colored, enlarged, shaking bell while Pi is running
+- **Subagent cost** — separates main-model and recognized subagent-tool costs in the footer
 
 ## Shortcuts
 
@@ -68,19 +70,19 @@ After installation, restart Pi. The HUD window appears in the top-left corner.
 | In / Out | Green | Token usage this turn |
 | HitCache | Orange | Cache hit rate |
 | Ctx | Blue | Latest turn token usage as a percentage of the active model's context window |
-| Cost | Amber | Session token cost |
+| Cost | Amber | Main-model cost + recognized subagent-tool cost |
 
 ### Status
 
-- **RUNNING** — active within last 60 seconds
-- **THINKING** — idle 60s+ but model is generating
-- **IDLE** — no recent activity
+- **RUNNING** — Pi is active and the latest tool call is visible
+- **THINKING** — Pi is active without a visible tool call
+- **IDLE** — Pi has settled and is waiting for input
 
 ## How It Works
 
-The ESM extension registers Pi lifecycle hooks. On start it registers the current terminal and starts `pi_hud.py` only when the shared HUD is not already alive. The Python side tails the latest Pi session JSONL file and reads settings / models for live status, rendering a compact Tkinter overlay. Multiple Pi terminals share this one HUD process through a PID registry; the HUD exits only after the last registered terminal is gone.
+The ESM extension registers Pi lifecycle hooks. On start it registers the current terminal and starts `pi_hud.py` only when the shared monitor is not already alive. The Python side tails the latest Pi session JSONL file and reads settings / models for live status, rendering a compact Tkinter overlay. Multiple Pi terminals share this one monitor process through a PID registry; it exits only after the last registered terminal is gone.
 
-On reload, the Node extension reuses the existing HUD and only removes its own terminal registration, so another terminal cannot make the shared panel disappear.
+On reload, the Node extension reuses the existing monitor and only removes its own terminal registration, so another terminal cannot make the shared panel disappear.
 
 ### Context calculation
 
@@ -94,13 +96,13 @@ When an assistant usage record omits `totalTokens`, the HUD derives it from `inp
 
 ## Themes
 
-Right-click the HUD and open **theme** to choose **Dark**, **White**, or **Paper Beige**. The selection is saved with the window geometry and restored on the next launch.
+Right-click the monitor and open **theme** to choose **Dark**, **White**, or **Paper Beige**. The selection is saved with the window geometry and restored on the next launch.
 
 ![Dark](assets/dark.png)
 
 ![White](assets/white.png)
 
-![Paper Beige](assets/paper beige.png)
+![Paper Beige](assets/paper-beige.png)
 
 ## Data sources
 
@@ -110,6 +112,8 @@ Right-click the HUD and open **theme** to choose **Dark**, **White**, or **Paper
 | Provider / Model | Session JSONL — assistant message fields |
 | Thinking level | Session JSONL — `thinking_level_change` event |
 | Token usage | Session JSONL — assistant message usage |
+| Main / subagent cost | Main-session usage plus recognized subagent tool results and async status artifacts |
+| Activity status | Session JSONL — `agent_start` / `agent_settled` lifecycle events |
 | OAuth status | `~/.pi/agent/auth.json` — provider credential expiry |
 | Context window | `models.json` → `models-store.json` → compatibility metadata |
 

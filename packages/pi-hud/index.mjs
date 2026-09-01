@@ -26,6 +26,45 @@ let registered = false;
 let retryTimer = null;
 let shuttingDown = false;
 
+const AGENT_STATE_ENTRY = "pi-hud:agent-state";
+const SUBAGENT_COST_ENTRY = "pi-hud:subagent-cost";
+
+function persistAgentState(pi, active) {
+  try {
+    pi.appendEntry(AGENT_STATE_ENTRY, { active });
+  } catch {
+    // HUD status must never affect the Pi run.
+  }
+}
+
+function numericCost(value) {
+  if (value && typeof value === "object") {
+    for (const key of ["total", "costUsd", "totalCost", "cost"]) {
+      const cost = numericCost(value[key]);
+      if (cost > 0) return cost;
+    }
+    return 0;
+  }
+  const cost = Number(value);
+  return Number.isFinite(cost) && cost > 0 ? cost : 0;
+}
+
+function persistSubagentCost(pi, event) {
+  const id = event?.id ?? event?.runId;
+  if (id === undefined || id === null || id === "") return;
+  const cost = Math.max(
+    numericCost(event?.usage?.cost),
+    numericCost(event?.usage?.costUsd),
+    numericCost(event?.totalCost),
+    numericCost(event?.cost),
+  );
+  try {
+    pi.appendEntry(SUBAGENT_COST_ENTRY, { id: String(id), cost });
+  } catch {
+    // HUD accounting must never affect the Pi run.
+  }
+}
+
 const extDir = dirname(fileURLToPath(import.meta.url));
 const hudScript = join(extDir, "pi_hud.py");
 
@@ -169,8 +208,27 @@ function stopHUD() {
 }
 
 export default function piHUD(pi) {
+  pi.events.on("subagents:completed", (event) => persistSubagentCost(pi, event));
+  pi.events.on("subagents:failed", (event) => persistSubagentCost(pi, event));
+
+  pi.on("session_start", () => {
+    persistAgentState(pi, false);
+  });
+
   pi.on("before_agent_start", () => {
     startHUD();
+  });
+
+  pi.on("agent_start", () => {
+    persistAgentState(pi, true);
+  });
+
+  pi.on("agent_settled", () => {
+    persistAgentState(pi, false);
+  });
+
+  pi.on("session_shutdown", () => {
+    persistAgentState(pi, false);
   });
 
   // session_shutdown is not the lifetime end of a Pi terminal. The shared HUD

@@ -166,6 +166,9 @@ class HUD(tk.Tk):
         self._status_group = None
         self._status_row = None
         self._footer_syncing = False
+        self._bell_active = False
+        self._bell_frame = 0
+        self._bell_after = None
         self._footer_lines = 1
         self._last_min_height = MIN_H
         self._resize_min_h = MIN_H
@@ -216,7 +219,7 @@ class HUD(tk.Tk):
         self.btn_next.bind("<Enter>", lambda e: self.btn_next.config(fg=C["accent"]))
         self.btn_next.bind("<Leave>", lambda e: self.btn_next.config(fg=C["sub"]))
 
-        self.lbl_title = tk.Label(tb, text="● Pi HUD", bg=C["title"], fg=C["accent"])
+        self.lbl_title = tk.Label(tb, text="● Pi Task Monitor", bg=C["title"], fg=C["accent"])
         self.lbl_title.pack(side="left", padx=10)
 
         self.lbl_session = tk.Label(
@@ -279,6 +282,8 @@ class HUD(tk.Tk):
         status_group = tk.Frame(status_row, bg=C["bg"])
         self._status_group = status_group
         status_group.pack(expand=True)
+        self.lbl_bell = tk.Label(status_group, text="🔔", bg=C["bg"], fg=C["dim"])
+        self.lbl_bell.pack(side="left", padx=(0, 8))
         self.lbl_status = tk.Label(status_group, text="OFFLINE", bg=C["bg"], fg=C["dim"])
         self.lbl_status.pack(side="left")
         self.lbl_time = tk.Label(status_group, text="", bg=C["bg"], fg=C["dim"])
@@ -333,7 +338,7 @@ class HUD(tk.Tk):
         # Route edge events before child widget class bindings. This keeps footer and corners resizable.
         for widget in (
             tb, body, ft, self.txt_footer, status_row, status_group,
-            self.lbl_status, self.lbl_time, self.lbl_cmd,
+            self.lbl_bell, self.lbl_status, self.lbl_time, self.lbl_cmd,
         ):
             widget.bindtags((str(widget), str(self), "all", widget.winfo_class()))
         # 绑定右键菜单、快捷键
@@ -585,6 +590,7 @@ class HUD(tk.Tk):
             (self.btn_x, fm(False, BASE_FONT - 1, "bold")),
             (self.btn_prev, fm(False, BASE_FONT - 1)),
             (self.btn_next, fm(False, BASE_FONT - 1)),
+            (self.lbl_bell, fm(False, BASE_FONT + 8, "bold")),
             (self.lbl_status, fm(False, BASE_FONT + 2, "bold")),
             (self.lbl_time, fm(False, BASE_FONT + 2, "bold")),
             (self.lbl_cmd, fm(True, BASE_FONT + 4)),
@@ -592,6 +598,28 @@ class HUD(tk.Tk):
         ]
         for w, fn in widgets:
             w.config(font=fn)
+
+    def _set_bell(self, active, color):
+        self._bell_active = active
+        self.lbl_bell.config(fg=color)
+        if active:
+            if self._bell_after is None:
+                self._shake_bell()
+            return
+        if self._bell_after is not None:
+            self.after_cancel(self._bell_after)
+            self._bell_after = None
+        self._bell_frame = 0
+        self.lbl_bell.config(text="🔔")
+
+    def _shake_bell(self):
+        self._bell_after = None
+        if not self._bell_active:
+            return
+        frames = ("🔔", " 🔔", "🔔 ", "🔔")
+        self.lbl_bell.config(text=frames[self._bell_frame % len(frames)])
+        self._bell_frame += 1
+        self._bell_after = self.after(140, self._shake_bell)
 
     # ── Data Poll ──
     def _poll(self):
@@ -730,6 +758,7 @@ class HUD(tk.Tk):
             (self.btn_pin, "fg", C["accent"] if self._topmost else C["dim"]),
             (self.btn_min, "bg", C["title"]), (self.btn_min, "fg", C["sub"]),
             (self.btn_x, "bg", C["title"]), (self.btn_x, "fg", C["sub"]),
+            (self.lbl_bell, "bg", C["bg"]), (self.lbl_bell, "fg", C["dim"]),
             (self.lbl_status, "bg", C["bg"]), (self.lbl_status, "fg", C["dim"]),
             (self.lbl_cmd, "bg", C["bg"]), (self.lbl_cmd, "fg", C["text"]),
             (self.txt_footer, "bg", C["title"]), (self.txt_footer, "fg", C["text"]),
