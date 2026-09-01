@@ -14,6 +14,7 @@ import {
   mkdir,
   readFile,
   realpath,
+  rename,
   stat,
   unlink,
   writeFile,
@@ -41,6 +42,12 @@ const DEFAULT_MAX_SCAN_DIRS = 3_000;
 const DEFAULT_MAX_SCAN_MS = 5_000;
 const DEFAULT_GIT_TIMEOUT_MS = 60_000;
 const SHADOW_REPO_LOCK_STALE_MS = 15_000;
+const ACTIVE_SESSION_HEARTBEAT_MS = 10_000;
+const ACTIVE_SESSION_STALE_MS = 120_000;
+const STORAGE_LOCK_HEARTBEAT_MS = 10_000;
+const STORAGE_LOCK_STALE_MS = 120_000;
+const STORAGE_LOCK_WAIT_TIMEOUT_MS = 120_000;
+const PROCESS_STARTED_AT = Date.now() - process.uptime() * 1_000;
 const WORKSPACE_HISTORY_LOG_ENV = "PI_WORKSPACE_HISTORY_LOG";
 const PROJECT_MARKER_FILES = [
   ".git",
@@ -106,6 +113,8 @@ interface RuntimeState {
   cachedPaths?: WorkspaceStoragePaths;
   cleanupPromise?: Promise<void>;
   reusableRepoUpdatePromise?: Promise<void>;
+  activeSessionToken?: string;
+  activeSessionHeartbeat?: ReturnType<typeof setInterval>;
   lastCleanupAt?: number;
   lastKnownShadowHead?: string;
   initialSnapshotCommit?: string;
@@ -122,7 +131,6 @@ interface RuntimeState {
   beforeSnapshotPromise?: Promise<void>;
   turnSnapshots?: TurnSnapshotState;
   disabledNoticeReason?: string;
-  lastIndexPruneIgnoreSource?: string;
   lastExcludedWorkspacePaths?: string[];
   initializationNoticeShown?: boolean;
 }
@@ -158,6 +166,7 @@ interface WorkspaceStoragePaths {
   reusableGitDir: string;
   sessionRoot: string;
   shadowGitDir: string;
+  activeSessionDir: string;
   redoFile: string;
   turnSnapshotsFile: string;
   workspaceMetaFile: string;
@@ -179,6 +188,31 @@ interface SessionMeta {
   sessionId: string;
   createdAt: string;
   lastUsedAt: string;
+}
+
+interface ActiveSessionMarker {
+  version: 1;
+  pid: number;
+  processStartedAt: number;
+  sessionId: string;
+  token: string;
+  startedAt: string;
+  heartbeatAt: string;
+}
+
+interface LegacyActiveSessionMarker {
+  version: 1;
+  pid: number;
+  sessionId: string;
+  startedAt: string;
+}
+
+interface StorageLockOwner {
+  version: 1;
+  pid: number;
+  processStartedAt: number;
+  token: string;
+  heartbeatAt: string;
 }
 
 const DEFAULT_EXCLUDES = [
@@ -525,6 +559,7 @@ async function buildWorkspaceStoragePaths(
     reusableGitDir: path.join(workspaceRoot, "repo.git"),
     sessionRoot,
     shadowGitDir: path.join(sessionRoot, "repo.git"),
+    activeSessionDir: path.join(sessionRoot, ".active"),
     redoFile: path.join(sessionRoot, "redo.json"),
     turnSnapshotsFile: path.join(sessionRoot, "turn-snapshots.json"),
     workspaceMetaFile: path.join(workspaceRoot, "meta.json"),
@@ -568,6 +603,311 @@ async function readJsonFile<T>(filePath: string): Promise<T | undefined> {
     return JSON.parse(await readFile(filePath, "utf8")) as T;
   } catch {
     return undefined;
+  }
+}
+
+async function isStorageLockStale(lockDir: string): Promise<boolean> {
+  const owner = await readJsonFile<StorageLockOwner>(
+    path.join(lockDir, "owner.json"),
+  );
+  if (
+    owner &&
+    owner.version === 1 &&
+    Number.isInteger(owner.pid) &&
+    owner.pid > 0 &&
+    Number.isFinite(owner.processStartedAt) &&
+    typeof owner.token === "string" &&
+    Number.isFinite(Date.parse(owner.heartbeatAt))
+  ) {
+    if (
+      owner.pid === process.pid &&
+      owner.processStartedAt === PROCESS_STARTED_AT
+    ) {
+      return false;
+    }
+    if (Date.now() - Date.parse(owner.heartbeatAt) <= STORAGE_LOCK_STALE_MS) {
+      return false;
+    }
+    try {
+      process.kill(owner.pid, 0);
+      return false;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ESRCH";
+    }
+  }
+
+  const lockStat = await stat(lockDir).catch(() => undefined);
+  return !!lockStat && Date.now() - lockStat.mtimeMs > STORAGE_LOCK_STALE_MS;
+}
+
+async function reapStaleStorageLock(
+  storageDir: string,
+  lockDir: string,
+): Promise<boolean> {
+  const staleDir = path.join(storageDir, `.stale-lock-${randomUUID()}`);
+  try {
+    await rename(lockDir, staleDir);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "EEXIST") {
+      throw error;
+    }
+    return false;
+  }
+
+  if (!(await isStorageLockStale(staleDir))) {
+    try {
+      await rename(staleDir, lockDir);
+    } catch {
+      return false;
+    }
+    return false;
+  }
+  await fsRm(staleDir, { recursive: true, force: true }).catch(
+    () => undefined,
+  );
+  return true;
+}
+
+async function releaseStorageLock(
+  lockDir: string,
+  owner: StorageLockOwner,
+): Promise<void> {
+  const currentOwner = await readJsonFile<StorageLockOwner>(
+    path.join(lockDir, "owner.json"),
+  );
+  if (
+    !currentOwner ||
+    currentOwner.token !== owner.token ||
+    currentOwner.pid !== owner.pid ||
+    currentOwner.processStartedAt !== owner.processStartedAt
+  ) {
+    return;
+  }
+  await fsRm(lockDir, { recursive: true, force: true }).catch(
+    () => undefined,
+  );
+}
+
+async function withStorageLock<T>(
+  storageDir: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const lockDir = path.join(storageDir, ".lock");
+  await mkdir(storageDir, { recursive: true });
+  const waitStartedAt = Date.now();
+
+  for (;;) {
+    try {
+      await mkdir(lockDir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+
+      if (await isStorageLockStale(lockDir)) {
+        if (!(await reapStaleStorageLock(storageDir, lockDir))) {
+          await sleep(50);
+        }
+        continue;
+      }
+
+      if (Date.now() - waitStartedAt >= STORAGE_LOCK_WAIT_TIMEOUT_MS) {
+        throw new Error(`workspace history lock timed out: ${storageDir}`);
+      }
+      await sleep(50);
+      continue;
+    }
+
+    const token = randomUUID();
+    const ownerPath = path.join(lockDir, "owner.json");
+    const owner: StorageLockOwner = {
+      version: 1,
+      pid: process.pid,
+      processStartedAt: PROCESS_STARTED_AT,
+      token,
+      heartbeatAt: new Date().toISOString(),
+    };
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    try {
+      await writeJsonFile(ownerPath, owner);
+      heartbeat = setInterval(() => {
+        void writeJsonFile(ownerPath, {
+          ...owner,
+          heartbeatAt: new Date().toISOString(),
+        }).catch(() => undefined);
+      }, STORAGE_LOCK_HEARTBEAT_MS);
+      heartbeat.unref?.();
+      return await operation();
+    } finally {
+      if (heartbeat) {
+        clearInterval(heartbeat);
+      }
+      await releaseStorageLock(lockDir, owner);
+    }
+  }
+}
+
+async function markSessionActive(
+  ctx: ExtensionContext,
+  state?: RuntimeState,
+): Promise<void> {
+  const paths = await getWorkspaceStoragePaths(ctx, state);
+  const previousToken = state?.activeSessionToken;
+  if (state?.activeSessionHeartbeat) {
+    clearInterval(state.activeSessionHeartbeat);
+    state.activeSessionHeartbeat = undefined;
+  }
+
+  const token = randomUUID();
+  await withStorageLock(paths.storageDir, async () => {
+    const lockedPaths = await ensureStorageDirs(ctx, state);
+    const markerPath = path.join(lockedPaths.activeSessionDir, `${token}.json`);
+    await writeJsonFile(markerPath, {
+      version: 1 as const,
+      pid: process.pid,
+      processStartedAt: PROCESS_STARTED_AT,
+      sessionId: ctx.sessionManager.getSessionId(),
+      token,
+      startedAt: new Date().toISOString(),
+      heartbeatAt: new Date().toISOString(),
+    } satisfies ActiveSessionMarker);
+    if (previousToken) {
+      await unlink(
+        path.join(lockedPaths.activeSessionDir, `${previousToken}.json`),
+      ).catch(() => undefined);
+    }
+  });
+
+  if (state) {
+    state.activeSessionToken = token;
+    state.activeSessionHeartbeat = setInterval(() => {
+      void refreshSessionActive(ctx, state);
+    }, ACTIVE_SESSION_HEARTBEAT_MS);
+    state.activeSessionHeartbeat.unref?.();
+  }
+}
+
+async function refreshSessionActive(
+  ctx: ExtensionContext,
+  state: RuntimeState,
+): Promise<void> {
+  const token = state.activeSessionToken;
+  if (!token) {
+    return;
+  }
+  const paths = await getWorkspaceStoragePaths(ctx, state);
+  await withStorageLock(paths.storageDir, async () => {
+    const markerPath = path.join(paths.activeSessionDir, `${token}.json`);
+    const marker = await readJsonFile<ActiveSessionMarker>(markerPath);
+    if (
+      !marker ||
+      marker.pid !== process.pid ||
+      marker.processStartedAt !== PROCESS_STARTED_AT ||
+      marker.sessionId !== ctx.sessionManager.getSessionId() ||
+      marker.token !== token
+    ) {
+      return;
+    }
+    await writeJsonFile(markerPath, {
+      ...marker,
+      heartbeatAt: new Date().toISOString(),
+    });
+  }).catch(() => undefined);
+}
+
+async function clearSessionActive(
+  ctx: ExtensionContext,
+  state?: RuntimeState,
+): Promise<void> {
+  if (state?.activeSessionHeartbeat) {
+    clearInterval(state.activeSessionHeartbeat);
+    state.activeSessionHeartbeat = undefined;
+  }
+  const token = state?.activeSessionToken;
+  if (!token) {
+    return;
+  }
+  const paths = await getWorkspaceStoragePaths(ctx, state);
+  await withStorageLock(paths.storageDir, async () => {
+    await unlink(path.join(paths.activeSessionDir, `${token}.json`)).catch(
+      () => undefined,
+    );
+  });
+  state.activeSessionToken = undefined;
+}
+
+async function isSessionActive(
+  sessionRoot: string,
+  sessionId: string,
+): Promise<boolean> {
+  const activeDir = path.join(sessionRoot, ".active");
+  const entries = await readdir(activeDir, { withFileTypes: true }).catch(
+    () => [],
+  );
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) {
+      continue;
+    }
+
+    const marker = await readJsonFile<ActiveSessionMarker>(
+      path.join(activeDir, entry.name),
+    );
+    if (
+      !marker ||
+      marker.version !== 1 ||
+      marker.sessionId !== sessionId ||
+      marker.token !== entry.name.slice(0, -5) ||
+      !Number.isInteger(marker.pid) ||
+      marker.pid <= 0 ||
+      !Number.isFinite(marker.processStartedAt)
+    ) {
+      return true;
+    }
+
+    const heartbeatAt = Date.parse(marker.heartbeatAt);
+    if (!Number.isFinite(heartbeatAt)) {
+      return true;
+    }
+    if (
+      marker.pid === process.pid &&
+      marker.processStartedAt === PROCESS_STARTED_AT
+    ) {
+      return true;
+    }
+    if (Date.now() - heartbeatAt <= ACTIVE_SESSION_STALE_MS) {
+      return true;
+    }
+  }
+
+  const legacyMarkerPath = path.join(sessionRoot, ".active.json");
+  const legacyMarker = await readJsonFile<LegacyActiveSessionMarker>(
+    legacyMarkerPath,
+  );
+  if (!legacyMarker) {
+    return pathExists(legacyMarkerPath);
+  }
+  if (
+    legacyMarker.version !== 1 ||
+    legacyMarker.sessionId !== sessionId ||
+    !Number.isInteger(legacyMarker.pid) ||
+    legacyMarker.pid <= 0
+  ) {
+    return true;
+  }
+
+  const legacyStartedAt = Date.parse(legacyMarker.startedAt);
+  if (
+    !Number.isFinite(legacyStartedAt) ||
+    Date.now() - legacyStartedAt > ACTIVE_SESSION_STALE_MS
+  ) {
+    return false;
+  }
+  try {
+    process.kill(legacyMarker.pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
 }
 
@@ -658,14 +998,164 @@ async function listSubdirectories(dirPath: string): Promise<string[]> {
   try {
     const entries = await readdir(dirPath, { withFileTypes: true });
     return entries
-      .filter((entry) => entry.isDirectory())
+      .filter(
+        (entry) =>
+          entry.isDirectory() && !entry.name.startsWith(".deleting-"),
+      )
       .map((entry) => entry.name);
   } catch {
     return [];
   }
 }
 
+async function workspaceHasActiveSession(workspaceRoot: string): Promise<boolean> {
+  const sessionsRoot = path.join(workspaceRoot, "sessions");
+  for (const sessionId of await listSubdirectories(sessionsRoot)) {
+    if (await isSessionActive(path.join(sessionsRoot, sessionId), sessionId)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function normalizeStoragePath(filePath: string): string {
+  const normalized = path.normalize(filePath).replace(/\\/g, "/");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+async function hasSharedRepoDependents(
+  workspaceRoot: string,
+  reusableGitDir: string,
+): Promise<boolean> {
+  const expectedPaths = new Set([
+    normalizeStoragePath(reusableGitDir),
+    normalizeStoragePath(path.join(reusableGitDir, "objects")),
+  ]);
+  const sessionsRoot = path.join(workspaceRoot, "sessions");
+  for (const sessionId of await listSubdirectories(sessionsRoot)) {
+    const alternatesPath = path.join(
+      sessionsRoot,
+      sessionId,
+      "repo.git",
+      "objects",
+      "info",
+      "alternates",
+    );
+    const source = await readFile(alternatesPath, "utf8").catch(() => "");
+    if (
+      source
+        .split(/\r?\n/)
+        .some((alternate) =>
+          expectedPaths.has(normalizeStoragePath(alternate.trim())),
+        )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function removeInactivePath(
+  targetPath: string,
+  isActive: (targetPath: string) => Promise<boolean>,
+): Promise<void> {
+  const deletingPath = path.join(
+    path.dirname(targetPath),
+    `.deleting-${randomUUID()}`,
+  );
+  try {
+    await rename(targetPath, deletingPath);
+  } catch {
+    return;
+  }
+
+  const reactivated = await exists(targetPath);
+  if (reactivated || (await isActive(deletingPath))) {
+    if (!reactivated) {
+      await rename(deletingPath, targetPath).catch(() => undefined);
+    }
+    return;
+  }
+
+  if (await exists(targetPath)) {
+    return;
+  }
+  await fsRm(deletingPath, { recursive: true, force: true }).catch(
+    () => undefined,
+  );
+}
+
+async function isBareShadowGitDir(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  gitDir: string,
+  state?: RuntimeState,
+): Promise<boolean> {
+  const result = await withTimeout(
+    pi.exec(
+      "git",
+      ["--git-dir", gitDir, "rev-parse", "--is-bare-repository"],
+      { cwd: ctx.cwd },
+    ),
+    await getGitTimeoutMs(ctx, state),
+    "git shadow repo validation",
+  );
+  return result.code === 0 && result.stdout.trim() === "true";
+}
+
+async function isReusableShadowGitDir(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  gitDir: string,
+  state?: RuntimeState,
+): Promise<boolean> {
+  if (!(await isBareShadowGitDir(pi, ctx, gitDir, state))) {
+    return false;
+  }
+
+  const result = await withTimeout(
+    pi.exec(
+      "git",
+      [
+        "--git-dir",
+        gitDir,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "HEAD^{commit}",
+      ],
+      { cwd: ctx.cwd },
+    ),
+    await getGitTimeoutMs(ctx, state),
+    "git reusable shadow repo validation",
+  );
+  return result.code === 0;
+}
+
+async function quarantineInvalidShadowGitDir(
+  ctx: ExtensionContext,
+  gitDir: string,
+  state?: RuntimeState,
+): Promise<string> {
+  const quarantineDir = `${gitDir}.invalid-${Date.now()}-${randomUUID()}`;
+  try {
+    await rename(gitDir, quarantineDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return gitDir;
+    }
+    throw error;
+  }
+  await logLine(
+    ctx,
+    `quarantine invalid repo from=${gitDir} to=${quarantineDir}`,
+    state,
+  );
+  return quarantineDir;
+}
+
 async function findReusableShadowGitDir(
+  pi: ExtensionAPI,
   ctx: ExtensionContext,
   state?: RuntimeState,
 ): Promise<{ gitDir: string; shared: boolean } | undefined> {
@@ -675,12 +1165,23 @@ async function findReusableShadowGitDir(
     (await exists(paths.reusableGitDir)) &&
     !(await exists(path.join(paths.reusableGitDir, "index.lock")))
   ) {
-    await logLine(
-      ctx,
-      `reuse workspace repo candidate gitDir=${paths.reusableGitDir}`,
-      state,
-    );
-    return { gitDir: paths.reusableGitDir, shared: true };
+    if (await isReusableShadowGitDir(pi, ctx, paths.reusableGitDir, state)) {
+      await logLine(
+        ctx,
+        `reuse workspace repo candidate gitDir=${paths.reusableGitDir}`,
+        state,
+      );
+      return { gitDir: paths.reusableGitDir, shared: true };
+    }
+    if (
+      !(await isBareShadowGitDir(pi, ctx, paths.reusableGitDir, state)) &&
+      !(await hasSharedRepoDependents(
+        paths.workspaceRoot,
+        paths.reusableGitDir,
+      ))
+    ) {
+      await quarantineInvalidShadowGitDir(ctx, paths.reusableGitDir, state);
+    }
   }
 
   const sessionIds = await listSubdirectories(paths.sessionsRoot);
@@ -705,7 +1206,8 @@ async function findReusableShadowGitDir(
   )) {
     if (
       !(await exists(candidate.gitDir)) ||
-      (await exists(path.join(candidate.gitDir, "index.lock")))
+      (await exists(path.join(candidate.gitDir, "index.lock"))) ||
+      !(await isReusableShadowGitDir(pi, ctx, candidate.gitDir, state))
     ) {
       continue;
     }
@@ -736,6 +1238,21 @@ async function updateReusableShadowRepo(
     (await exists(path.join(paths.shadowGitDir, "index.lock")))
   ) {
     return;
+  }
+
+  if (
+    (await exists(paths.reusableGitDir)) &&
+    !(await isBareShadowGitDir(pi, ctx, paths.reusableGitDir, state))
+  ) {
+    if (
+      await hasSharedRepoDependents(
+        paths.workspaceRoot,
+        paths.reusableGitDir,
+      )
+    ) {
+      return;
+    }
+    await quarantineInvalidShadowGitDir(ctx, paths.reusableGitDir, state);
   }
 
   if (!(await exists(paths.reusableGitDir))) {
@@ -795,9 +1312,24 @@ async function cleanupWorkspaceHistory(
   ctx: ExtensionContext,
   state?: RuntimeState,
 ): Promise<void> {
+  const paths = await getWorkspaceStoragePaths(ctx, state);
+  await withStorageLock(paths.storageDir, () =>
+    cleanupWorkspaceHistoryUnlocked(ctx, state),
+  );
+}
+
+async function cleanupWorkspaceHistoryUnlocked(
+  ctx: ExtensionContext,
+  state?: RuntimeState,
+): Promise<void> {
   const settings = await getWorkspaceHistorySettings(ctx, state);
   const paths = await ensureStorageDirs(ctx, state);
   const currentSessionId = ctx.sessionManager.getSessionId();
+  await logLine(
+    ctx,
+    `cleanup start session=${currentSessionId}`,
+    state,
+  ).catch(() => undefined);
 
   const sessionIds = await listSubdirectories(paths.sessionsRoot);
   const sessionRecords = await Promise.all(
@@ -821,8 +1353,11 @@ async function cleanupWorkspaceHistory(
   for (const record of removableSessions.slice(
     Math.max(0, settings.maxSessionsPerWorkspace - 1),
   )) {
-    await fsRm(record.sessionRoot, { recursive: true, force: true }).catch(
-      () => undefined,
+    if (await isSessionActive(record.sessionRoot, record.sessionId)) {
+      continue;
+    }
+    await removeInactivePath(record.sessionRoot, (targetPath) =>
+      isSessionActive(targetPath, record.sessionId),
     );
   }
 
@@ -849,14 +1384,25 @@ async function cleanupWorkspaceHistory(
   for (const record of removableWorkspaces.slice(
     Math.max(0, settings.maxWorkspaces - 1),
   )) {
-    await fsRm(record.workspaceRoot, { recursive: true, force: true }).catch(
-      () => undefined,
-    );
+    if (await workspaceHasActiveSession(record.workspaceRoot)) {
+      continue;
+    }
+    await removeInactivePath(record.workspaceRoot, workspaceHasActiveSession);
   }
+
+  await logLine(
+    ctx,
+    `cleanup done session=${currentSessionId}`,
+    state,
+  ).catch(() => undefined);
 }
 
 function normalizeSnapshotPath(relativePath: string): string {
   return relativePath.replace(/\\/g, "/").replace(/^\.\//, "");
+}
+
+function parseNullSeparatedPaths(output: string): string[] {
+  return output.split("\0").filter((relativePath) => relativePath.length > 0);
 }
 
 export function isWindowsReservedSnapshotPath(relativePath: string): boolean {
@@ -1041,6 +1587,7 @@ async function execGit(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   args: string[],
+  preserveStdout = false,
 ): Promise<string> {
   const state = undefined;
   const timeoutMs = await getGitTimeoutMs(ctx, state);
@@ -1074,7 +1621,7 @@ async function execGit(
           `git ok retry ${elapsedMs(startedAt)}ms ${summarizeGitArgs(args)}`,
           state,
         ).catch(() => undefined);
-        return retry.stdout.trim();
+        return preserveStdout ? retry.stdout : retry.stdout.trim();
       }
       throw new Error(
         `git ${args.join(" ")} failed after clearing stale index.lock: ${retry.stderr || retry.stdout}`,
@@ -1089,7 +1636,7 @@ async function execGit(
       state,
     ).catch(() => undefined);
   }
-  return result.stdout.trim();
+  return preserveStdout ? result.stdout : result.stdout.trim();
 }
 
 async function gitArgs(
@@ -1196,30 +1743,23 @@ async function pruneShadowIndexForIgnoreChanges(
   state?: RuntimeState,
 ): Promise<void> {
   const startedAt = Date.now();
-  const gitignoreSource = await readFile(
-    path.join(ctx.cwd, ".gitignore"),
-    "utf8",
-  ).catch(() => "");
-  if (state?.lastIndexPruneIgnoreSource === gitignoreSource) {
-    await logLine(
-      ctx,
-      `prune ignored paths skipped cached ${elapsedMs(startedAt)}ms`,
-      state,
-    );
-    return;
-  }
+  const excludedWorkspacePaths = await listExcludedWorkspacePaths(ctx, state);
+  const trackedOutput = await execGit(
+    pi,
+    ctx,
+    await gitArgs(ctx, state, "ls-files", "-z", "--cached"),
+    true,
+  );
+  const matcher = await getSnapshotIgnoreMatcher(ctx, state);
+  const excludedTrackedPaths = parseNullSeparatedPaths(trackedOutput).filter(
+    (relativePath) =>
+      matcher.ignores(normalizeSnapshotPath(relativePath)) ||
+      isWindowsReservedSnapshotPath(relativePath),
+  );
+  const excludedPaths = [
+    ...new Set([...excludedWorkspacePaths, ...excludedTrackedPaths]),
+  ];
 
-  if (state && state.lastIndexPruneIgnoreSource === undefined) {
-    state.lastIndexPruneIgnoreSource = gitignoreSource;
-    await logLine(
-      ctx,
-      `prune ignored paths skipped initial ${elapsedMs(startedAt)}ms`,
-      state,
-    );
-    return;
-  }
-
-  const excludedPaths = await listExcludedWorkspacePaths(ctx, state);
   await logLine(
     ctx,
     `prune ignored paths scanned ${elapsedMs(startedAt)}ms count=${excludedPaths.length}`,
@@ -1227,7 +1767,6 @@ async function pruneShadowIndexForIgnoreChanges(
   );
   await removeExcludedPathsFromShadowIndex(pi, ctx, excludedPaths, state);
   if (state) {
-    state.lastIndexPruneIgnoreSource = gitignoreSource;
     state.lastExcludedWorkspacePaths = excludedPaths;
   }
   await logLine(
@@ -1250,7 +1789,6 @@ async function stageSnapshotFiles(
     `stage snapshot git-add done ${elapsedMs(startedAt)}ms`,
     state,
   );
-  await pruneShadowIndexForIgnoreChanges(pi, ctx, state);
   await logLine(ctx, `stage snapshot done ${elapsedMs(startedAt)}ms`, state);
 }
 
@@ -1322,25 +1860,38 @@ async function ensureShadowRepo(
   await assertWorkspaceHistoryEnabled(ctx, state, "ensureShadowRepo");
   const paths = await ensureStorageDirs(ctx, state);
   if (await exists(paths.shadowGitDir)) {
-    await syncShadowRepoExclude(ctx, state);
-    await logLine(
-      ctx,
-      `ensure shadow repo existing done ${elapsedMs(startedAt)}ms`,
-      state,
-    );
-    return;
+    if (await isBareShadowGitDir(pi, ctx, paths.shadowGitDir, state)) {
+      await syncShadowRepoExclude(ctx, state);
+      await logLine(
+        ctx,
+        `ensure shadow repo existing done ${elapsedMs(startedAt)}ms`,
+        state,
+      );
+      return;
+    }
+    await quarantineInvalidShadowGitDir(ctx, paths.shadowGitDir, state);
   }
 
-  const reusableGitDir = await findReusableShadowGitDir(ctx, state);
+  const reusableGitDir = await findReusableShadowGitDir(pi, ctx, state);
   if (reusableGitDir) {
     await execGit(pi, ctx, [
       "clone",
-      ...(reusableGitDir.shared ? ["--shared"] : []),
+      "--no-local",
       "--bare",
       reusableGitDir.gitDir,
       paths.shadowGitDir,
     ]);
-    await execGit(pi, ctx, await gitArgs(ctx, state, "read-tree", "HEAD"));
+    if (!(await isBareShadowGitDir(pi, ctx, paths.shadowGitDir, state))) {
+      await quarantineInvalidShadowGitDir(ctx, paths.shadowGitDir, state);
+      await execGit(pi, ctx, ["init", "--bare", paths.shadowGitDir]);
+    } else {
+      await execGit(pi, ctx, await gitArgs(ctx, state, "read-tree", "HEAD"));
+    }
+    if (!(await isBareShadowGitDir(pi, ctx, paths.shadowGitDir, state))) {
+      throw new Error(
+        `Git did not create a valid bare repository at ${paths.shadowGitDir}`,
+      );
+    }
     await logLine(
       ctx,
       `clone repo session=${ctx.sessionManager.getSessionId()} shared=${String(reusableGitDir.shared)} from=${reusableGitDir.gitDir} gitDir=${paths.shadowGitDir}`,
@@ -1348,6 +1899,11 @@ async function ensureShadowRepo(
     );
   } else {
     await execGit(pi, ctx, ["init", "--bare", paths.shadowGitDir]);
+    if (!(await isBareShadowGitDir(pi, ctx, paths.shadowGitDir, state))) {
+      throw new Error(
+        `Git did not create a valid bare repository at ${paths.shadowGitDir}`,
+      );
+    }
     await logLine(
       ctx,
       `init repo session=${ctx.sessionManager.getSessionId()} gitDir=${paths.shadowGitDir}`,
@@ -1378,6 +1934,7 @@ async function createSnapshotCommit(
     );
     await assertWorkspaceHistoryEnabled(ctx, state, "createSnapshotCommit");
     await ensureShadowRepo(pi, ctx, state);
+    await pruneShadowIndexForIgnoreChanges(pi, ctx, state);
     if (!assumeDirty) {
       const currentHead =
         state?.lastKnownShadowHead ?? (await getHeadCommit(pi, ctx, state));
@@ -2570,6 +3127,10 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     state.baselineWarmupPromise = undefined;
     state.baselineWarmupGeneration = undefined;
     state.baselineWarmupInProgress = false;
+    if (state.activeSessionHeartbeat) {
+      clearInterval(state.activeSessionHeartbeat);
+      state.activeSessionHeartbeat = undefined;
+    }
     state.snapshotWritePromise = undefined;
     state.beforeSnapshotPromise = undefined;
     state.reusableRepoUpdatePromise = undefined;
@@ -2577,9 +3138,11 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     state.initializationNoticeShown = false;
 
     if (!(await ensureWorkspaceHistoryAvailable(ctx, state, "session_start"))) {
+      await clearSessionActive(ctx, state);
       return;
     }
 
+    await markSessionActive(ctx, state);
     await getWorkspaceHistorySettings(ctx, state);
     await getWorkspaceStoragePaths(ctx, state);
     await touchWorkspaceAndSessionMeta(ctx, state);
@@ -2596,6 +3159,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", async (_event, ctx) => {
     const state = getState(ctx);
     await state.reusableRepoUpdatePromise?.catch(() => undefined);
+    await clearSessionActive(ctx, state);
   });
 
   pi.on("input", async (event, ctx) => {
