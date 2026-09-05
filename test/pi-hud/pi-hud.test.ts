@@ -12,7 +12,6 @@ const pythonSource = readFileSync(join(packageDir, "pi_hud.py"), "utf8");
 const extensionSource = readFileSync(join(packageDir, "index.mjs"), "utf8");
 const dataSource = readFileSync(join(packageDir, "data.py"), "utf8");
 const themeSource = readFileSync(join(packageDir, "theme.py"), "utf8");
-const modelConfigSource = readFileSync(join(packageDir, "model_config.py"), "utf8");
 const viewSource = readFileSync(join(packageDir, "view.py"), "utf8");
 const readmeSource = readFileSync(join(packageDir, "README.md"), "utf8");
 
@@ -58,6 +57,80 @@ assert cache.get_lines() == ['{"session":"A"}\\n'], cache.get_lines()
   });
 });
 
+test("provider-scoped model mapping prefers models.json and supports runtime aliases", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-model-map-"));
+  const models = join(root, "models.json");
+  const modelsStore = join(root, "models-store.json");
+  writeFileSync(models, JSON.stringify({
+    providers: {
+      "provider-a": { models: [{ id: "gpt-5.6-luna", name: "Luna" }] },
+      other: { models: [{ id: "gpt-5.6-luna-max" }] },
+    },
+  }));
+  writeFileSync(modelsStore, JSON.stringify({
+    "provider-a": { models: [{ id: "gpt-5.6-terra" }] },
+  }));
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(models)})
+assert cache.model_for("provider-a", "Luna") == "gpt-5.6-luna"
+assert cache.model_for("provider-a", "gpt-5.6-luna-max") == "gpt-5.6-luna"
+assert cache.model_for("provider-a", "gpt-5.6-terra") == "gpt-5.6-terra"
+assert cache.model_for("other", "gpt-5.6-luna-max") == "gpt-5.6-luna-max"
+assert cache.model_for("provider-a", "unknown-model") == "unknown-model"
+`;
+  runPython(script, process.env);
+});
+
+test("saved HUD geometry is recentered when it leaves the virtual desktop", () => {
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+import pi_hud
+
+class FakeWindow:
+    def winfo_vrootx(self): return -1920
+    def winfo_vrooty(self): return 0
+    def winfo_vrootwidth(self): return 3840
+    def winfo_vrootheight(self): return 1080
+
+pi_hud._user32 = None
+window = FakeWindow()
+assert pi_hud._safe_window_position(window, 680, 100, 2500, 80) == (-340, 80)
+assert pi_hud._safe_window_position(window, 680, 100, -2500, 80) == (-340, 80)
+assert pi_hud._safe_window_position(window, 680, 100, -1500, 80) == (-1500, 80)
+assert pi_hud._safe_window_position(window, 680, 100, 100, 100) == (100, 100)
+`;
+  runPython(script, process.env);
+  assert.match(pythonSource, /def _virtual_screen_bounds\(window\):/);
+  assert.match(pythonSource, /def _safe_window_position\(window, width, height, x, y\):/);
+  assert.match(pythonSource, /self\._ensure_on_screen\(\)/);
+});
+
+test("manual model config overrides automatic provider mapping", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-manual-model-"));
+  const models = join(root, "models.json");
+  const manual = join(root, "model_config.json");
+  writeFileSync(models, JSON.stringify({
+    providers: { "provider-a": { models: [{ id: "configured-model" }] } },
+  }));
+  writeFileSync(manual, JSON.stringify({
+    mappings: { "provider-a": { "runtime-model": "manual-model" } },
+    contextWindows: { "provider-a": { "manual-model": 999000 } },
+  }));
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(models)}, ${JSON.stringify(manual)})
+assert cache.model_for("provider-a", "runtime-model") == "manual-model"
+assert cache.ctx_win_for("provider-a", "manual-model") == 999000
+`;
+  runPython(script, process.env);
+});
+
 test("context windows use the active model instead of the provider's first model", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-hud-ctx-"));
   const models = join(root, "models.json");
@@ -66,13 +139,13 @@ test("context windows use the active model instead of the provider's first model
     models,
     JSON.stringify({
       providers: {
-        duckcode: {
+        "provider-a": {
           models: [{ id: "claude-opus-5", contextWindow: 372000 }],
         },
-        agentrouter: {
+        "provider-b": {
           models: [{ id: "gpt-5.6-sol", contextWindow: 372000 }],
         },
-        "openai-codex": {
+        "provider-c": {
           modelOverrides: {
             "gpt-5.6-sol": { contextWindow: 1050000 },
           },
@@ -83,7 +156,7 @@ test("context windows use the active model instead of the provider's first model
   writeFileSync(
     modelsStore,
     JSON.stringify({
-      "openai-codex": {
+      "provider-c": {
         models: [
           { id: "gpt-5.6-sol", contextWindow: 272000 },
           { id: "gpt-5.6-terra", contextWindow: 272000 },
@@ -91,19 +164,34 @@ test("context windows use the active model instead of the provider's first model
       },
     }),
   );
+  writeFileSync(
+    join(root, "model_config.json"),
+    JSON.stringify({
+      mappings: {
+        "provider-a": {
+          "gpt-5.6-luna-max": "gpt-5.6-luna-max",
+          "gpt-5.6-terra-ultra": "gpt-5.6-terra-ultra",
+        },
+      },
+      contextWindows: {
+        "provider-a": {
+          "gpt-5.6-luna-max": 272000,
+          "gpt-5.6-terra-ultra": 272000,
+        },
+      },
+    }),
+  );
   const script = `
-import os, sys
+import sys
 sys.path.insert(0, ${JSON.stringify(packageDir)})
-os.environ["PI_AGENT_DIR"] = ${JSON.stringify(root)}
-import pi_hud
-pi_hud.MODELS_JSON = ${JSON.stringify(models)}
-cache = pi_hud._SessionCache()
-assert cache.ctx_win_for("duckcode", "gpt-5.6-luna-max") == 272000
-assert cache.ctx_win_for("duckcode", "gpt-5.6-terra-ultra") == 272000
-assert cache.ctx_win_for("openai-codex", "gpt-5.6-terra") == 272000
-assert cache.ctx_win_for("openai-codex", "gpt-5.6-sol") == 1050000
-assert cache.ctx_win_for("agentrouter", "gpt-5.6-sol") == 372000
-assert cache.ctx_win_for("duckcode", "unknown-model") == 0
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(models)}, ${JSON.stringify(join(root, "model_config.json"))})
+assert cache.ctx_win_for("provider-a", "gpt-5.6-luna-max") == 272000
+assert cache.ctx_win_for("provider-a", "gpt-5.6-terra-ultra") == 272000
+assert cache.ctx_win_for("provider-c", "gpt-5.6-terra") == 272000
+assert cache.ctx_win_for("provider-c", "gpt-5.6-sol") == 1050000
+assert cache.ctx_win_for("provider-b", "gpt-5.6-sol") == 372000
+assert cache.ctx_win_for("provider-a", "unknown-model") == 0
 `;
   runPython(script, { ...process.env, PI_AGENT_DIR: root });
 });
@@ -872,7 +960,7 @@ test("context usage falls back to the latest usage components", () => {
   writeFileSync(
     join(root, "models-store.json"),
     JSON.stringify({
-      "openai-codex": {
+      "provider-c": {
         models: [{ id: "gpt-5.6-terra", contextWindow: 272000 }],
       },
     }),
@@ -884,7 +972,7 @@ test("context usage falls back to the latest usage components", () => {
         timestamp: "2026-01-01T00:00:00Z",
         message: {
           role: "assistant",
-          provider: "duckcode",
+          provider: "provider-a",
           model: "old-model",
           usage: { input: 100, output: 100, totalTokens: 200 },
         },
@@ -893,7 +981,7 @@ test("context usage falls back to the latest usage components", () => {
         timestamp: "2026-01-01T00:01:00Z",
         message: {
           role: "assistant",
-          provider: "openai-codex",
+          provider: "provider-c",
           model: "gpt-5.6-terra",
           usage: {
             input: 1000,
@@ -918,7 +1006,7 @@ collector = Collector(
     os.path.join(root, "auth.json"),
 )
 result = collector.collect()
-assert result["provider"] == "openai-codex"
+assert result["provider"] == "provider-c"
 assert result["model"] == "gpt-5.6-terra"
 assert result["tokens"]["total"] == 18200
 assert round(result["tokens"]["ctx_pct"], 1) == 6.7
@@ -992,7 +1080,7 @@ test("HUD startup is idempotent and restart-safe across terminals", () => {
   assert.match(pythonSource, /O_EXCL/);
   assert.match(pythonSource, /MANAGED_MODE/);
   assert.match(themeSource, /THEMES = \{/);
-  assert.match(modelConfigSource, /KNOWN_CONTEXT_WINDOWS/);
+  assert.match(dataSource, /model_config\.json/);
 });
 
 test("resize retains named Tk fonts until their sizes are updated", () => {

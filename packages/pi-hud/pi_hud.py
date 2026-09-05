@@ -21,8 +21,10 @@ from theme import C, THEMES
 # ── Windows API: 检查进程存活 ──
 if sys.platform == "win32":
     _kernel32 = ctypes.windll.kernel32
+    _user32 = ctypes.windll.user32
 else:
     _kernel32 = None
+    _user32 = None
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -38,6 +40,37 @@ def _is_pid_alive(pid: int) -> bool:
         return True
     except (ProcessLookupError, PermissionError, OSError):
         return False
+
+
+def _virtual_screen_bounds(window):
+    """Return the current virtual desktop bounds, including all monitors."""
+    if _user32 is not None:
+        # SM_X/YVIRTUALSCREEN and SM_CXVIRTUALSCREEN/CY... are 76..79.
+        return tuple(int(_user32.GetSystemMetrics(index)) for index in range(76, 80))
+    try:
+        return (
+            int(window.winfo_vrootx()),
+            int(window.winfo_vrooty()),
+            int(window.winfo_vrootwidth()),
+            int(window.winfo_vrootheight()),
+        )
+    except (AttributeError, tk.TclError, TypeError, ValueError):
+        return (0, 0, int(window.winfo_screenwidth()), int(window.winfo_screenheight()))
+
+
+def _safe_window_position(window, width, height, x, y):
+    """Keep a saved position visible after monitors change."""
+    left, top, area_width, area_height = _virtual_screen_bounds(window)
+    right, bottom = left + area_width, top + area_height
+    if width > area_width:
+        x = left
+    elif x < left or x + width > right:
+        x = left + max(0, (area_width - width) // 2)
+    if height > area_height:
+        y = top
+    elif y < top or y + height > bottom:
+        y = top + max(0, (area_height - height) // 2)
+    return x, y
 
 
 MANAGED_MODE = "--managed" in sys.argv
@@ -623,6 +656,7 @@ class HUD(tk.Tk):
 
     # ── Data Poll ──
     def _poll(self):
+        self._ensure_on_screen()
         try:
             while True:
                 self._render(self.q.get_nowait())
@@ -774,6 +808,17 @@ class HUD(tk.Tk):
             self.txt_footer.tag_config(tag, foreground=C[color])
 
 
+    def _ensure_on_screen(self):
+        try:
+            width, height = self.winfo_width(), self.winfo_height()
+            x, y = self.winfo_x(), self.winfo_y()
+            safe_x, safe_y = _safe_window_position(self, width, height, x, y)
+            if (safe_x, safe_y) != (x, y):
+                self.geometry(f"{width}x{height}+{safe_x}+{safe_y}")
+                self._save_geom()
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            pass
+
     def _load_geom(self):
         try:
             with open(CFG_FILE, encoding="utf-8") as f:
@@ -785,7 +830,14 @@ class HUD(tk.Tk):
                 return
             width = max(MIN_W, int(match.group(1)))
             height = max(MIN_H, int(match.group(2)))
-            self.geometry(f"{width}x{height}{match.group(3)}")
+            position = match.group(3)
+            x, y = 120, 80
+            if position:
+                parts = re.findall(r"[+-]\d+", position)
+                if len(parts) == 2:
+                    x, y = map(int, parts)
+            x, y = _safe_window_position(self, width, height, x, y)
+            self.geometry(f"{width}x{height}+{x}+{y}")
         except (OSError, json.JSONDecodeError, AttributeError, TypeError, ValueError, tk.TclError):
             pass
 

@@ -487,13 +487,16 @@ def _subagent_costs(lines):
 
 
 class SessionCache:
-    def __init__(self, sessions_dir=None, models_json=None):
+    def __init__(self, sessions_dir=None, models_json=None, model_config_json=None):
         home = os.path.expanduser("~")
         agent_dir = os.getenv("PI_AGENT_DIR", os.path.join(home, ".pi", "agent"))
         self.sessions_dir = sessions_dir or os.path.join(agent_dir, "sessions")
         self.models_json = models_json or os.path.join(agent_dir, "models.json")
         self.models_store_json = os.path.join(
             os.path.dirname(self.models_json), "models-store.json"
+        )
+        self.model_config_json = model_config_json or os.path.join(
+            home, ".pi", "model_config.json"
         )
         self._file = None
         self._follow_latest = True
@@ -621,14 +624,52 @@ class SessionCache:
         return self._lines
 
     @staticmethod
-    def _context_window_in(catalog, provider, model):
+    def _provider_config(catalog, provider):
         if not isinstance(catalog, dict):
-            return 0
+            return {}
         providers = catalog.get("providers")
         providers = providers if isinstance(providers, dict) else catalog
         config = providers.get(provider, {})
+        return config if isinstance(config, dict) else {}
+
+    @classmethod
+    def _model_in(cls, catalog, provider, model):
+        config = cls._provider_config(catalog, provider)
+        for entry in config.get("models", []):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("id") == model or entry.get("name") == model:
+                return entry.get("id") or model
+        overrides = config.get("modelOverrides", {})
+        if isinstance(overrides, dict) and model in overrides:
+            return model
+        return None
+
+    @staticmethod
+    def _model_config_in(config, section, provider, model):
         if not isinstance(config, dict):
+            return None
+        providers = config.get(section, {})
+        if not isinstance(providers, dict):
+            return None
+        provider_config = providers.get(provider, {})
+        if not isinstance(provider_config, dict):
+            return None
+        value = provider_config.get(model)
+        return value if value is not None else None
+
+    def _manual_model_config(self, provider, model):
+        config = load_json(self.model_config_json)
+        mapped = self._model_config_in(config, "mappings", provider, model)
+        if isinstance(mapped, str) and mapped:
+            return mapped
+        return None
+
+    @classmethod
+    def _context_window_in(cls, catalog, provider, model):
+        if not isinstance(catalog, dict):
             return 0
+        config = cls._provider_config(catalog, provider)
         for entry in config.get("models", []):
             if not isinstance(entry, dict):
                 continue
@@ -636,6 +677,30 @@ class SessionCache:
                 return entry.get("contextWindow", 128000) or 128000
         override = config.get("modelOverrides", {}).get(model, {})
         return override.get("contextWindow", 0) if isinstance(override, dict) else 0
+
+    def model_for(self, provider, model):
+        """Resolve a runtime model to the configured model for its provider."""
+        mapped = self._manual_model_config(provider, model)
+        if mapped:
+            return mapped
+        if not provider or not model:
+            return model
+        catalogs = [load_json(self.models_json), load_json(self.models_store_json)]
+        for catalog in catalogs:
+            resolved = self._model_in(catalog, provider, model)
+            if resolved:
+                return resolved
+
+        # Some providers expose a runtime alias with a provider-specific suffix.
+        # Only accept it when the shortened id exists in that provider's catalog.
+        for suffix in ("-max", "-ultra"):
+            if model.endswith(suffix):
+                base = model[: -len(suffix)]
+                for catalog in catalogs:
+                    resolved = self._model_in(catalog, provider, base)
+                    if resolved:
+                        return resolved
+        return model
 
     def ctx_win_for(self, provider, model):
         key = (provider, model)
@@ -647,8 +712,10 @@ class SessionCache:
             if self._ctx_win:
                 break
         if not self._ctx_win:
-            from model_config import KNOWN_CONTEXT_WINDOWS
-            self._ctx_win = KNOWN_CONTEXT_WINDOWS.get(key, 0)
+            config = load_json(self.model_config_json)
+            value = self._model_config_in(config, "contextWindows", provider, model)
+            if isinstance(value, (int, float)) and value > 0:
+                self._ctx_win = value
         self._cached_key = key
         return self._ctx_win
 
@@ -772,7 +839,8 @@ class Collector:
                 if in_t + cache_read:
                     tokens["hit_rate"] = cache_read / (in_t + cache_read) * 100
                 self._provider = message.get("provider") or self._provider
-                self._model = message.get("model") or self._model
+                requested_model = message.get("model") or self._model
+                self._model = self._cache.model_for(self._provider, requested_model)
                 cmd_ts = cmd_ts or event.get("timestamp", "")
             if not cmd and message.get("role") == "assistant":
                 for call in message.get("content", []):

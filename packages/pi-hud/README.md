@@ -11,7 +11,7 @@ Always-on-top real-time task monitor for [Pi](https://github.com/earendil-works/
 │                               RUNNING                                 │
 │                   ▶ edit relative/path/to/file.py                     │
 ├───────────────────────────────────────────────────────────────────────┤
-│ 🧠 OpenRouter 🔒  ·  claude-opus  ·  high  │  In 801  Out 875  │ ...  │
+│ 🧠 provider-a 🔒  ·  claude-opus  ·  high  │  In 801  Out 875  │ ...  │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -26,6 +26,8 @@ After installation, restart Pi. The monitor window appears in the top-left corne
 ## Features
 
 - **Multi-session aware** — switches between multiple Pi terminal sessions
+- **Multi-monitor safe** — validates the saved window position against the current virtual desktop and recenters it when a monitor is disconnected or the layout changes
+- **Provider-aware model display** — maps the model requested in the session to the matching model configured for that provider, with safe fallback to the runtime value
 - **Reload-safe** — `/settings reload` or Pi restart automatically refreshes the HUD
 - **OAuth indicator** — 🔒 shown when the current provider has valid login credentials
 - **Session navigation** — ◀ ▶ buttons or keyboard shortcuts to browse sessions
@@ -86,13 +88,32 @@ On reload, the Node extension reuses the existing monitor and only removes its o
 
 ### Context calculation
 
-`Ctx` divides the latest assistant usage total by the active provider/model context window. The context window lookup order is:
+`Ctx` divides the latest assistant usage total by the active provider/model context window. The displayed model is resolved within the active provider before the context window lookup. The context window lookup order is:
 
 1. `~/.pi/agent/models.json`, including `modelOverrides`
 2. Pi's built-in `~/.pi/agent/models-store.json`
-3. Package compatibility metadata for known runtime aliases
+3. Optional manual compatibility entries in `~/.pi/model_config.json`
 
-When an assistant usage record omits `totalTokens`, the HUD derives it from `input + output + cacheRead + cacheWrite`.
+### Manual model mapping
+
+Automatic mapping is provider-scoped and uses the actual provider/model from the session. For runtime aliases that cannot be inferred automatically, create the optional `~/.pi/model_config.json`:
+
+```json
+{
+  "mappings": {
+    "provider-a": {
+      "gpt-5.6-luna-max": "gpt-5.6-luna"
+    }
+  },
+  "contextWindows": {
+    "provider-a": {
+      "gpt-5.6-luna-max": 272000
+    }
+  }
+}
+```
+
+`mappings` and `contextWindows` are both keyed by provider and then the runtime model. A manual mapping takes precedence over automatic catalog mapping. The file is optional, ignored when missing or invalid, and is not included in the package.
 
 ## Themes
 
@@ -109,13 +130,13 @@ Right-click the monitor and open **theme** to choose **Dark**, **White**, or **P
 | Display | Source |
 | --------- | -------- |
 | Current command | Session JSONL — latest assistant toolCall |
-| Provider / Model | Session JSONL — assistant message fields |
+| Provider / Model | Session JSONL provides the actual provider/model request; the displayed model is normalized against that provider's `models.json` / `models-store.json` catalog |
 | Thinking level | Session JSONL — `thinking_level_change` event |
 | Token usage | Session JSONL — assistant message usage |
 | Main / subagent cost | Main-session usage, all tool-result usage, and compaction/branch-summary usage; recognized subagent-tool cost is shown separately |
 | Activity status | Session JSONL — `agent_start` / `agent_settled` lifecycle events |
 | OAuth status | `~/.pi/agent/auth.json` — provider credential expiry |
-| Context window | `models.json` → `models-store.json` → compatibility metadata |
+| Context window | `models.json` → `models-store.json` → `~/.pi/model_config.json` |
 
 ## Manual start (development)
 
