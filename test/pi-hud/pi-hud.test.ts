@@ -176,7 +176,7 @@ import sys
 sys.path.insert(0, ${JSON.stringify(packageDir)})
 from data import SessionCache
 cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
-assert round(cache.cost, 2) == 10.25
+assert round(cache.cost, 2) == 11.9
 assert round(cache.subagents_cost, 2) == 1.65, cache.subagents_cost
 `;
   runPython(script, process.env);
@@ -199,6 +199,33 @@ sys.path.insert(0, ${JSON.stringify(packageDir)})
 from data import SessionCache
 cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
 assert round(cache.cost, 2) == 0.6, cache.cost
+`;
+  runPython(script, process.env);
+});
+
+test("main cost matches Pi by including usage reported by subagent tools", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-pi-cost-"));
+  writeFileSync(
+    join(root, "session.jsonl"),
+    [
+      { type: "message", message: { role: "assistant", usage: { cost: { total: 12.89186324 } } } },
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "steer_subagent",
+          usage: { cost: { total: 1.11484 } },
+        },
+      },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
+  );
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert abs(cache.cost - 14.00670324) < 1e-9, cache.cost
+assert abs(cache.subagents_cost - 1.11484) < 1e-9, cache.subagents_cost
 `;
   runPython(script, process.env);
 });
@@ -807,7 +834,7 @@ test("bell state, subagent cost footer, and visible name have regression guards"
   assert.match(viewSource, /agent_active/);
   assert.doesNotMatch(viewSource, /60s/);
   assert.match(viewSource, /_fmt_money\(cost\).*_fmt_money\(subagents_cost\)/s);
-  assert.match(viewSource, /\(subagents\)/);
+  assert.match(viewSource, /Pi.*subagents/);
   assert.match(pythonSource, /● Pi Task Monitor/);
   assert.match(readmeSource, /# Pi Task Monitor/);
 

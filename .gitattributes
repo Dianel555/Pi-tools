@@ -1,7 +1,12 @@
-* text=auto
-*.sh text eol=lf
-*.mjs text eol=lf
-*.ts text eol=lf
-*.json text eol=lf
-*.md text eol=lf
-*.yml text eol=lf
+# Normalize text files to LF on checkout and commit (avoids CRLF/LF churn)
+* text=auto eol=lf
+
+# Binary assets — never normalize
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary

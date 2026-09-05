@@ -62,7 +62,7 @@ def render(self, d):
     self.txt_footer.insert("end", "  │  ", "sep")
     # 费用 (橙色)
     self.txt_footer.insert(
-        "end", f"{_fmt_money(cost)} + {_fmt_money(subagents_cost)} (subagents)", "cost"
+        "end", f"{_fmt_money(cost)} Pi  ·  {_fmt_money(subagents_cost)} subagents", "cost"
     )
     # 全选文字加上 body tag 预留下伸空间
     self.txt_footer.tag_add("body", "1.0", "end")

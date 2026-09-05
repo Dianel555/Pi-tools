@@ -565,10 +565,9 @@ class SessionCache:
                     message = entry.get("message", {})
                     usage = message.get("usage") or {}
                     role = message.get("role")
-                    tool_name = str(message.get("toolName") or "").lower()
                     if usage and (
                         role == "assistant"
-                        or (role == "toolResult" and tool_name not in SUBAGENT_TOOL_NAMES)
+                        or role == "toolResult"
                     ):
                         self._cost += _usage_cost(usage)
                 except (json.JSONDecodeError, AttributeError, TypeError, ValueError):

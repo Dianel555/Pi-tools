@@ -32,7 +32,7 @@ After installation, restart Pi. The monitor window appears in the top-left corne
 - **Responsive layout** — footer switches between one and two rows; horizontal resizing preserves the current UI scale, while vertical resizing keeps status and command content centered
 - **Context visibility** — resolves the active model's context window from Pi's custom and built-in model catalogs
 - **Task activity** — shows a colored, enlarged, shaking bell while Pi is running
-- **Subagent cost** — separates main-model and recognized subagent-tool costs in the footer
+- **Subagent cost** — keeps Pi's session total aligned with the native footer and shows recognized subagent-tool cost as a separate breakdown
 
 ## Shortcuts
 
@@ -70,7 +70,7 @@ After installation, restart Pi. The monitor window appears in the top-left corne
 | In / Out | Green | Token usage this turn |
 | HitCache | Orange | Cache hit rate |
 | Ctx | Blue | Latest turn token usage as a percentage of the active model's context window |
-| Cost | Amber | Main-model cost + recognized subagent-tool cost |
+| Cost | Amber | Pi session total, with recognized subagent-tool cost shown as a separate breakdown |
 
 ### Status
 
@@ -112,7 +112,7 @@ Right-click the monitor and open **theme** to choose **Dark**, **White**, or **P
 | Provider / Model | Session JSONL — assistant message fields |
 | Thinking level | Session JSONL — `thinking_level_change` event |
 | Token usage | Session JSONL — assistant message usage |
-| Main / subagent cost | Main-session usage plus recognized subagent tool results and async status artifacts |
+| Main / subagent cost | Main-session usage, all tool-result usage, and compaction/branch-summary usage; recognized subagent-tool cost is shown separately |
 | Activity status | Session JSONL — `agent_start` / `agent_settled` lifecycle events |
 | OAuth status | `~/.pi/agent/auth.json` — provider credential expiry |
 | Context window | `models.json` → `models-store.json` → compatibility metadata |
