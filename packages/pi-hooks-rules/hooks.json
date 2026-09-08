@@ -13,7 +13,7 @@
     {
       "id": "destructive-command-guard",
       "event": "tool_call",
-      "tools": ["bash", "powershell"],
+      "tools": ["bash", "powershell", "cmd"],
       "command": "${node}",
       "args": ["${hooksDir}/destructive-command-guard.mjs"],
       "timeoutMs": 5000,

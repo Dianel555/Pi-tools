@@ -100,7 +100,7 @@ A `tool_call` payload has `tool_name` and `tool_input`. A `tool_result` payload 
 
 Common tool groups are:
 
-- **Command tools:** `bash`, `powershell`
+- **Command tools:** `bash`, `powershell`, `cmd`
 - **File tools:** `read`, `write`, `edit`
 - **Search and other tools:** `grep`, `find`, `ls`, or the exact name of a custom Pi tool
 
@@ -167,7 +167,7 @@ The plugin also accepts the legacy `{ "decision": "block", "reason": "..." }` sh
 | ID | Event | Tools | Default timeout | Purpose |
 |----|-------|-------|-----------------|---------|
 | `secret-guard` | `tool_call` | `bash`, `powershell`, `write`, `edit` | 5s | Blocks recognized API keys, tokens, private keys, and credential URLs. |
-| `destructive-command-guard` | `tool_call` | `bash`, `powershell` | 5s | Blocks protected Git operations and unsafe recursive deletion; allows recognized disposable targets. |
+| `destructive-command-guard` | `tool_call` | `bash`, `powershell`, `cmd` | 5s | Blocks protected Git operations and unsafe recursive deletion; allows recognized disposable targets. |
 | `syntax-format-check` | `tool_result` | `write`, `edit` | 10s | Checks JavaScript, JSON, shell, and Python syntax; runs local Prettier when available. |
 
 Disable or re-enable a bundled hook with a minimal override:

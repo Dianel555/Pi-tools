@@ -14,7 +14,6 @@ const haystack = [
   toolInput.command,
   toolInput.content,
   toolInput.new_string,
-  toolInput.old_string,
   toolInput.prompt,
 ]
   .filter((value) => typeof value === "string")

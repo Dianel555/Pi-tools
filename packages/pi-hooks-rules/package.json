@@ -1,6 +1,6 @@
 {
   "name": "@dianel/pi-hooks-rules",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Manage Pi tool hooks through /hooks and inject rules automatically",
   "author": "Dianel555",
   "license": "MIT",
