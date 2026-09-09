@@ -77,7 +77,6 @@ test("destructive guard denies broad deletion and permits disposable targets", (
 
 test("destructive guard handles mixed-case protected Git commands", () => {
   for (const command of [
-    "git COMMIT -m test",
     "git PUSH --FORCE",
     "git PUSH --FORCE-WITH-LEASE",
     "git RESET --HARD",
@@ -95,6 +94,155 @@ test("destructive guard handles mixed-case protected Git commands", () => {
   }
 });
 
+test("destructive guard distinguishes Git -C from config and preserves destructive checks", () => {
+  const routine = [
+    "git -C C:/Users/Yanghao/.pi/agent status --short",
+    'git -C "C:/Users/Yanghao/.pi/agent" status --short',
+    "git -C C:/repo -C sub status --short",
+    "git log -C",
+    "git status -- -cache.txt",
+    "git commit -m test",
+  ];
+  for (const tool_name of ["Bash", "PowerShell", "Cmd"]) {
+    for (const command of routine) {
+      const result = runHook("destructive-command-guard.mjs", { tool_name, tool_input: { command } });
+      assert.equal(result.status, 0, `${tool_name}: ${command}`);
+      assert.equal(result.stdout, "", `${tool_name}: ${command}`);
+    }
+  }
+
+  for (const [command, rule] of [
+    ["git -C C:/repo reset --hard", "git_reset_hard"],
+    ["git -C C:/repo clean -fd", "git_clean_force"],
+  ] as const) {
+    const result = runHook("destructive-command-guard.mjs", {
+      tool_name: "Bash",
+      tool_input: { command },
+    });
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.hookSpecificOutput.permissionDecision, "deny", command);
+    assert.match(output.hookSpecificOutput.permissionDecisionReason, new RegExp(`blocked ${rule}`), command);
+  }
+});
+
+test("destructive guard allows safe expansions and bounded Bash control flow", () => {
+  const allowed = [
+    ["Bash", 'echo "$HOME"'],
+    ["Bash", 'echo "${HOME}"'],
+    ["Bash", 'echo ${HOME}'],
+    ["Bash", 'echo "\\$HOME"'],
+    ["Bash", 'echo \'literal\'"$HOME"'],
+    ["Bash", 'echo \'$(rm -rf important-data)\' "$HOME"'],
+    ["Bash", 'echo \'literal$(rm -rf important-data)\'"$HOME"'],
+    ["Bash", 'printf \'%s\\n\' "$HOME"'],
+    ["Bash", "bash -c 'echo safe'"],
+    ["Bash", "if true; then echo safe; fi"],
+    ["Bash", "if false; then echo no; elif true; then echo yes; else echo no; fi"],
+  ];
+  for (const [tool_name, command] of allowed) {
+    const result = runHook("destructive-command-guard.mjs", { tool_name, tool_input: { command } });
+    assert.equal(result.status, 0, command);
+    assert.equal(result.stdout, "", command);
+  }
+
+  const denied = [
+    ["Bash", "$COMMAND --help"],
+    ["Bash", "X=$(rm -rf important-data) echo safe"],
+    ["Bash", "BASH_ENV=/tmp/unknown"],
+    ["Bash", "BASH_ENV=/tmp/unknown bash -c 'echo safe'"],
+    ["Bash", "export BASH_ENV+=/tmp/unknown; bash -c 'echo safe'"],
+    ["Bash", "printf -v BASH_ENV /tmp/unknown; bash -c 'echo safe'"],
+    ["Bash", 'echo "${HOME:-/tmp}"'],
+
+    ["Bash", "bash -c 'rm -rf important-data'"],
+    ["Bash", "bash -c \"echo '$(rm -rf important-data)'\""],
+    ["Bash", 'bash -c "echo $HOME"'],
+    ["Bash", "bash -lc 'echo safe'"],
+    ["Bash", "bash --noprofile -c 'echo safe'"],
+    ["Bash", "bash --command 'echo safe'"],
+    ["Bash", "bash -c 'echo safe' \"$(rm -rf important-data)\""],
+    ["Bash", "printf 'rm -rf important-data\\n' | bash -v"],
+    ["Bash", "printf 'git reset --hard\\n' | bash -h"],
+    ["Bash", "bash -v < /tmp/script"],
+    ["Bash", "if rm -rf important-data; then echo safe; fi"],
+    ["Bash", "if true; then rm -rf important-data; fi"],
+    ["Bash", "if true; then echo safe; else rm -rf important-data; fi"],
+    ["Bash", "if true; then echo safe; elif rm -rf important-data; then echo safe; fi"],
+    ["Bash", 'echo "$(rm -rf important-data)"'],
+    ["Bash", 'echo safe > "$(rm -rf important-data)"'],
+    ["Bash", "echo > \"'$(rm -rf important-data)'\""],
+    ["Bash", "export BASH_ENV=/tmp/unknown; bash -c 'echo safe'"],
+    ["Bash", "find . $OPTIONS"],
+    ["Bash", "python3 $OPTIONS"],
+    ["Bash", "node \"$SCRIPT\""],
+    ["Bash", "custom-tool \"$VALUE\""],
+    ["Bash", "trap \"$COMMAND\" EXIT"],
+    ["Bash", "trap 'rm -rf important-data' EXIT"],
+    ["Bash", "alias cleanup='rm -rf important-data'; cleanup"],
+    ["Bash", "start /b rm -rf important-data"],
+    ["Bash", "call /c rm -rf important-data"],
+    ["Bash", "set -a; FLAGS=-v; printf \"$FLAGS\" BASH_ENV /tmp/unknown; bash -c 'echo safe'"],
+    ["Bash", "set -a; for BASH_ENV in /tmp/unknown; do bash -c 'echo safe'; done"],
+    ["Bash", "while read BASH_ENV; do bash -c 'echo safe'; done"],
+    ["Bash", "set -a; select BASH_ENV in /tmp/unknown; do bash -c 'echo safe'; done"],
+    ["Bash", "declare -n startup=BASH_ENV; export startup=/tmp/unknown; bash -c 'echo safe'"],
+    ["Bash", "declare -gn startup=BASH_ENV; export startup=/tmp/unknown; bash -c 'echo safe'"],
+    ["Bash", "declare -ng startup=BASH_ENV; export startup=/tmp/unknown; bash -c 'echo safe'"],
+    ["Bash", "[[ \"$VALUE\" -eq 0 ]]"],
+    ["Bash", 'if [ "$HOME" = safe ]; then echo safe; else printf \'%s\' "$HOME"; fi'],
+    ["Bash", "f() { rm -rf important-data; }; f"],
+    ["Bash", "{ rm -rf important-data; }"],
+    ["Bash", "( rm -rf important-data )"],
+    ["Bash", "echo <(rm -rf important-data)"],
+  ];
+  for (const [tool_name, command] of denied) {
+    assert.equal(parseDecision(
+      runHook("destructive-command-guard.mjs", { tool_name, tool_input: { command } }),
+      command,
+    ), "deny", command);
+  }
+});
+
+test("destructive guard fails closed at the Bash control analysis depth", () => {
+  let command = "echo safe";
+  for (let index = 0; index < 20; index += 1) command = `if ${command}; then :; fi`;
+  assert.equal(parseDecision(
+    runHook("destructive-command-guard.mjs", { tool_name: "Bash", tool_input: { command } }),
+    command,
+  ), "deny", command);
+});
+
+test("destructive guard fails closed at the Bash wrapper analysis depth", () => {
+  const slash = String.fromCharCode(92);
+  const singleQuote = String.fromCharCode(39);
+  const doubleQuote = String.fromCharCode(34);
+  const quoteBash = (value: string) => {
+    const single = singleQuote
+      + value.split(singleQuote).join(singleQuote + slash + singleQuote + singleQuote)
+      + singleQuote;
+    const double = doubleQuote
+      + value.split(slash).join(slash + slash)
+        .split(doubleQuote).join(slash + doubleQuote)
+        .split("$").join(slash + "$")
+        .split("`").join(slash + "`")
+      + doubleQuote;
+    return single.length <= double.length ? single : double;
+  };
+  let shallow = ":";
+  for (let index = 0; index < 2; index += 1) shallow = `bash -c ${quoteBash(shallow)}`;
+  const shallowResult = runHook("destructive-command-guard.mjs", { tool_name: "Bash", tool_input: { command: shallow } });
+  assert.equal(shallowResult.status, 0, shallow);
+  assert.equal(shallowResult.stdout, "", shallow);
+
+  let command = ":";
+  for (let index = 0; index < 19; index += 1) command = `bash -c ${quoteBash(command)}`;
+  assert.ok(command.length < 65_536, `fixture length: ${command.length}`);
+  const result = runHook("destructive-command-guard.mjs", { tool_name: "Bash", tool_input: { command } });
+  assert.equal(result.status, 0, command);
+  assert.equal(parseDecision(result, command), "deny", command);
+  assert.match(JSON.parse(result.stdout).hookSpecificOutput.permissionDecisionReason, /blocked opaque_command/, command);
+});
+
 test("bundled destructive guard includes Cmd tools", () => {
   const hooks = JSON.parse(readFileSync(join(repoRoot, "packages", "pi-hooks-rules", "hooks.json"), "utf8"));
   const destructive = hooks.hooks.find((hook: { id: string }) => hook.id === "destructive-command-guard");
@@ -107,7 +255,6 @@ test("destructive guard covers recursive deletion across nested shell dialects",
     ["Bash", "rm --recursive important-data"],
     ["Bash", "/usr/bin/rm -rf important-data"],
     ["Bash", 'bash -c "rm -rf important-data"'],
-    ["Bash", "bash -c 'echo safe'"],
     ["Bash", 'sh -c "rm -rf important-data"'],
     ["Bash", 'cmd /c del /s /q important-data'],
     ["Bash", 'cmd /c rmdir /s /q important-data'],
