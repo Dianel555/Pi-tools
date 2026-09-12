@@ -1,5 +1,5 @@
 const MAX_COMMAND_LENGTH = 65_536;
-// Deeply nested shell wrappers fail closed instead of consuming unbounded parser stack.
+// Bound nested literal-wrapper inspection; exceeding the bound passes through as unknown syntax.
 const MAX_ANALYSIS_DEPTH = 16;
 
 const deleteAdvice = "Recursive delete is blocked. Run cleanup of throwaway artifacts as a standalone command; otherwise remove specific files or ask the user to run it manually.";
@@ -12,13 +12,13 @@ const safeDirectories = new Set([
 ]);
 const powershellDeletes = new Set(["remove-item", "ri", "rm", "rmdir", "rd", "del", "erase"]);
 const cmdDeletes = new Set(["del", "erase", "rmdir", "rd"]);
-const gitOptionsWithValue = new Set(["-c", "-C", "--config", "--config-env", "--git-dir", "--work-tree", "--namespace", "--exec-path"]);
+const gitOptionsWithValue = new Set(["--git-dir", "--work-tree", "--namespace", "--exec-path"]);
 const powershellPathOptions = new Set(["-path", "-literalpath"]);
 const powershellValueOptions = new Set(["-erroraction", "-warningaction", "-ea", "-wa", "-include", "-exclude", "-filter"]);
 const powershellRecurseNames = new Set(["-r", "-re", "-rec", "-recu", "-recur", "-recurs", "-recurse"]);
-const controlCommands = new Set(["if", "while", "until", "for", "then", "do", "else", "elif", "!", "coproc", "case", "select", "call", "start"]);
+const powershellPreviewNames = new Set(["-whatif", "-wi"]);
 const bashControlCommands = new Set(["if", "while", "until", "for", "then", "do", "else", "elif", "!", "coproc"]);
-const bashDataOnlyCommands = new Set(["echo", "printf"]);
+const bashShells = new Set(["bash", "sh", "dash", "zsh"]);
 
 function decision(permissionDecision, reason) {
   process.stdout.write(JSON.stringify({
@@ -37,30 +37,21 @@ function deny(rule, advice) {
 }
 
 function noDelete() {
-  return { hasDelete: false, safe: true, deleteOnly: false, opaque: false, blocked: undefined };
+  return { hasDelete: false, safe: true, blocked: undefined };
 }
 
-function deleteResult(safe, deleteOnly = true) {
-  return { hasDelete: true, safe, deleteOnly, opaque: false, blocked: undefined };
-}
-
-function opaqueResult() {
-  return { hasDelete: false, safe: false, deleteOnly: false, opaque: true, blocked: undefined };
+function deleteResult(safe) {
+  return { hasDelete: true, safe, blocked: undefined };
 }
 
 function blockedResult(rule) {
-  return { hasDelete: false, safe: false, deleteOnly: false, opaque: false, blocked: rule };
+  return { hasDelete: false, safe: true, blocked: rule };
 }
 
 function mergeResults(left, right) {
-  const hasDelete = left.hasDelete || right.hasDelete;
   return {
-    hasDelete,
+    hasDelete: left.hasDelete || right.hasDelete,
     safe: left.safe && right.safe,
-    deleteOnly: hasDelete
-      && (left.hasDelete ? left.deleteOnly : true)
-      && (right.hasDelete ? right.deleteOnly : true),
-    opaque: left.opaque || right.opaque,
     blocked: left.blocked || right.blocked,
   };
 }
@@ -102,10 +93,9 @@ function lex(source, dialect) {
   let quoted = false;
   let singleQuoted = false;
   let dynamic = false;
-  let unsafeExpansion = false;
   let parameterBraceDepth = 0;
   let quote = "";
-  let opaqueSyntax = false;
+  let uncertain = false;
 
   function pushWord() {
     if (!started) return;
@@ -115,7 +105,6 @@ function lex(source, dialect) {
       quoted,
       singleQuoted,
       dynamic,
-      unsafeExpansion,
     });
     value = "";
     parts = [];
@@ -123,7 +112,6 @@ function lex(source, dialect) {
     quoted = false;
     singleQuoted = false;
     dynamic = false;
-    unsafeExpansion = false;
   }
 
   function pushGroup() {
@@ -138,7 +126,11 @@ function lex(source, dialect) {
       if ((dialect === "bash" && character === "\\" && quote !== "'")
         || (dialect === "powershell" && character === "`" && quote !== "'")) {
         const next = source[index + 1];
-        if (next === undefined) throw new Error("unfinished escape");
+        if (next === undefined) {
+          value += character;
+          uncertain = true;
+          continue;
+        }
         index += 1;
         value += next;
       } else if (dialect === "powershell" && quote === "'" && character === "'" && source[index + 1] === "'") {
@@ -148,10 +140,7 @@ function lex(source, dialect) {
         quote = "";
       } else {
         value += character;
-        if (dialect !== "cmd" && quote !== "'" && (character === "$" || character === "`")) {
-          dynamic = true;
-          if (dialect === "bash" && (character === "`" || !simpleBashExpansionAt(source, index))) unsafeExpansion = true;
-        }
+        if (dialect !== "cmd" && quote !== "'" && (character === "$" || character === "`")) dynamic = true;
         if (dialect === "cmd" && (character === "%" || character === "!")) dynamic = true;
       }
       continue;
@@ -161,7 +150,12 @@ function lex(source, dialect) {
       || (dialect === "powershell" && character === "`")
       || (dialect === "cmd" && character === "^")) {
       const next = source[index + 1];
-      if (next === undefined) throw new Error("unfinished escape");
+      if (next === undefined) {
+        value += character;
+        started = true;
+        uncertain = true;
+        continue;
+      }
       index += 1;
       value += next;
       started = true;
@@ -180,35 +174,28 @@ function lex(source, dialect) {
       continue;
     }
     if (character === ">" || character === "<") {
-      const end = skipRedirection(source, index);
-      if (dialect === "bash" && redirectionHasExecutableExpansion(source.slice(index, end))) opaqueSyntax = true;
       if (/^\d+$/.test(value)) {
         value = "";
         started = false;
       } else {
         pushWord();
       }
-      index = end - 1;
+      index = skipRedirection(source, index) - 1;
       continue;
-    }
-    if (dialect === "powershell" && character === "&") {
-      let next = index + 1;
-      while (/\s/.test(source[next] ?? "")) next += 1;
-      opaqueSyntax ||= next >= source.length || ["(", "{", "$", "@", "`", "."].includes(source[next]);
     }
     if (dialect === "bash") {
       if (character === "$" && source[index + 1] === "{") parameterBraceDepth += 1;
       const closesParameterBrace = character === "}" && parameterBraceDepth > 0;
       if (closesParameterBrace) parameterBraceDepth -= 1;
       if (character === "(" || character === ")"
-        || ((character === "{" || character === "}") && !closesParameterBrace && parameterBraceDepth === 0)) opaqueSyntax = true;
+        || ((character === "{" || character === "}") && !closesParameterBrace && parameterBraceDepth === 0)) {
+        pushGroup();
+        continue;
+      }
     }
     if (dialect === "powershell" && (character === "(" || character === ")")) dynamic = true;
     if (dialect === "powershell" && character === "@") dynamic = true;
-    if (dialect !== "cmd" && (character === "$" || character === "`")) {
-      dynamic = true;
-      if (dialect === "bash" && (character === "`" || !simpleBashExpansionAt(source, index))) unsafeExpansion = true;
-    }
+    if (dialect !== "cmd" && (character === "$" || character === "`")) dynamic = true;
     if (dialect === "cmd" && (character === "%" || character === "!")) dynamic = true;
     if (";|&\n".includes(character)) {
       pushGroup();
@@ -227,9 +214,14 @@ function lex(source, dialect) {
     value += character;
     started = true;
   }
-  if (quote) throw new Error("unclosed quote");
-  pushGroup();
-  return { groups, opaqueSyntax };
+  // Do not turn an incomplete final group into a confidently parsed command.
+  if (quote) uncertain = true;
+  if (uncertain) {
+    words = [];
+  } else {
+    pushGroup();
+  }
+  return { groups, uncertain };
 }
 
 function safeTarget(word) {
@@ -257,101 +249,135 @@ function splitPowerShellTargets(word) {
   return (word.parts ?? [word.value]).map((value) => ({ ...word, value, parts: undefined }));
 }
 
-function simpleBashExpansionAt(source, index) {
-  const next = source[index + 1];
-  if (next === "{") return /^\$\{[a-z_][a-z0-9_]*\}/i.test(source.slice(index));
-  return /[a-z_]/i.test(next ?? "") || /[0-9#?*!@$-]/.test(next ?? "");
-}
-
-function hasUnsafeExpansion(word, dialect) {
-  return word.dynamic && (dialect !== "bash" || word.unsafeExpansion === true);
-}
-
-function isStartupVariable(value) {
-  return /^(?:BASH_ENV|ENV)(?:\+?=|$)/.test(value);
-}
-
-function redirectionHasExecutableExpansion(value) {
-  let quote = "";
-  for (let index = 0; index < value.length; index += 1) {
-    const character = value[index];
-    if (quote) {
-      if (character === "\\" && quote === '"') {
-        index += 1;
-      } else if (character === quote) {
-        quote = "";
-      } else if (quote === '"' && (character === "`" || (character === "$" && value[index + 1] === "("))) {
-        return true;
-      } else if (quote === '"' && character === "$" && !simpleBashExpansionAt(value, index)) {
-        return true;
-      }
-      continue;
-    }
-    if (character === "'" || character === '"') {
-      quote = character;
-    } else if (character === "\\") {
-      index += 1;
-    } else if (character === "`" || (character === "$" && value[index + 1] === "(")
-      || ((character === "<" || character === ">") && value[index + 1] === "(")) {
-      return true;
-    } else if (character === "$" && !simpleBashExpansionAt(value, index)) {
-      return true;
-    }
-  }
-  return false;
+function inspectWrapperScript(script, dialect, depth) {
+  if (!script.length) return noDelete();
+  if (script.length === 1) return inspectSource(script[0].value, dialect, depth + 1);
+  return inspectWords(script, dialect, depth + 1);
 }
 
 function inspectBashWrapper(words, depth) {
   const args = words.slice(1);
-  if (args.length === 1 && ["--help", "--version"].includes(args[0].value)) return noDelete();
-  if (!args[0] || args[0].dynamic || args[0].value !== "-c") return opaqueResult();
-  const script = args[1];
-  if (!script || script.dynamic) return opaqueResult();
-  if (args.slice(2).some((word) => hasUnsafeExpansion(word, "bash"))) return opaqueResult();
-  return inspectSource(script.value, "bash", depth + 1);
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index].value;
+    if (value === "--") return noDelete();
+    if (value === "-c" || /^-[^-]*c[^-]*$/.test(value)) {
+      return inspectWrapperScript(args.slice(index + 1, index + 2), "bash", depth);
+    }
+    if (!value.startsWith("-")) return noDelete();
+  }
+  return noDelete();
+}
+
+const powershellCliValueOptions = new Set([
+  "-configurationname", "-executionpolicy", "-inputformat", "-outputformat", "-version",
+  "-windowstyle", "-workingdirectory",
+]);
+
+function inspectPowerShellWrapper(words, depth) {
+  const args = words.slice(1);
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index].value.toLowerCase();
+    if (["-file", "-encodedcommand", "-encodedarguments", "--"].includes(value)) return noDelete();
+    if (["-c", "-command"].includes(value)) return inspectWrapperScript(args.slice(index + 1), "powershell", depth);
+    if (!value.startsWith("-")) return noDelete();
+    if (powershellCliValueOptions.has(value)) index += 1;
+  }
+  return noDelete();
+}
+
+function inspectCmdWrapper(words, depth) {
+  const args = words.slice(1);
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index].value.toLowerCase();
+    if (["/c", "/k"].includes(value)) return inspectWrapperScript(args.slice(index + 1), "cmd", depth);
+    if (!value.startsWith("/")) return noDelete();
+  }
+  return noDelete();
+}
+
+function inspectShellWrapper(words, name, depth) {
+  if (bashShells.has(name)) return inspectBashWrapper(words, depth);
+  if (name === "cmd") return inspectCmdWrapper(words, depth);
+  return inspectPowerShellWrapper(words, depth);
 }
 
 function inspectBashControl(words, depth) {
-  const name = commandName(words[0], "bash");
-  if (name === "for") {
-    if (isStartupVariable(words[1]?.value ?? "")) return opaqueResult();
-    return words.slice(1).some((word) => hasUnsafeExpansion(word, "bash")) ? opaqueResult() : noDelete();
-  }
   const nested = words.slice(1);
   return nested.length ? inspectWords(nested, "bash", depth + 1) : noDelete();
 }
 
+function gitDryRun(options, subcommand) {
+  for (let index = 0; index < options.length; index += 1) {
+    const value = options[index];
+    if (subcommand === "clean" && ["-e", "--exclude"].includes(value)) {
+      index += 1;
+      continue;
+    }
+    if (subcommand === "clean" && value.startsWith("--exclude=")) continue;
+    if (value === "--dry-run" || value === "-n" || /^-[a-z]*n[a-z]*$/.test(value)) return true;
+  }
+  return false;
+}
+
 function gitRule(words) {
   const args = words.slice(1);
-  if (args.some((word) => word.dynamic || (!word.quoted && word.value.startsWith("@")))) return "opaque";
-
   let index = 0;
   while (index < args.length) {
-    const value = args[index].value;
+    const raw = args[index].value;
+    const value = raw.toLowerCase();
     if (value === "--") {
       index += 1;
       break;
     }
-    if (!value.startsWith("-")) break;
-    if (value.startsWith("-c")
-      || value === "--config" || value.startsWith("--config=")
-      || value === "--config-env" || value.startsWith("--config-env=")) return "opaque";
-    if (gitOptionsWithValue.has(value)) {
-      if (!args[index + 1]) return "opaque";
+    if (!raw.startsWith("-")) break;
+
+    // Git's -c and -C are case-sensitive: -c is config, while -C selects a directory.
+    if (raw === "-c" || raw === "-C") {
+      if (!args[index + 1]) return undefined;
       index += 2;
-    } else {
-      index += 1;
+      continue;
     }
+    if ((raw.startsWith("-c") && !raw.startsWith("-C"))
+      || (raw.startsWith("-C") && raw.length > 2)) {
+      index += 1;
+      continue;
+    }
+    if (["--config", "--config-env"].includes(value)) {
+      if (!args[index + 1]) return undefined;
+      index += 2;
+      continue;
+    }
+    if (["--config=", "--config-env="].some((prefix) => value.startsWith(prefix))) {
+      index += 1;
+      continue;
+    }
+    if (gitOptionsWithValue.has(value)) {
+      if (!args[index + 1]) return undefined;
+      index += 2;
+      continue;
+    }
+    index += 1;
   }
+
   const subcommand = args[index]?.value.toLowerCase();
   if (!subcommand) return undefined;
   const rest = args.slice(index + 1).map((word) => word.value.toLowerCase());
-  if (subcommand === "push" && rest.some((value) => value.startsWith("--force") || value.startsWith("+") || /^-[a-z]*f[a-z]*$/.test(value))) return "git_push_force";
-  if (subcommand === "reset" && rest.includes("--hard")) return "git_reset_hard";
-  if (subcommand === "clean" && rest.some((value) => value === "--force" || /^-[a-z]*f[a-z]*$/.test(value))) return "git_clean_force";
-  if ((subcommand === "checkout" || subcommand === "restore") && rest.some((value) => /^\.(?:[\\/])?$/.test(value))) return "git_checkout_dot";
-  if (subcommand === "branch" && rest.some((value) => ["-d", "--delete"].includes(value))) return "git_branch_delete";
-  if (subcommand === "stash" && ["drop", "clear"].includes(rest[0])) return "git_stash_wipe";
+  const optionEnd = rest.indexOf("--");
+  const options = optionEnd < 0 ? rest : rest.slice(0, optionEnd);
+  const dryRun = gitDryRun(options, subcommand);
+  const forcedPush = options.some((value) => value.startsWith("--force") || /^-[a-z]*f[a-z]*$/.test(value))
+    || rest.some((value) => value.startsWith("+"));
+  if (subcommand === "push" && !dryRun && forcedPush) return "git_push_force";
+  if (subcommand === "reset" && options.includes("--hard")) return "git_reset_hard";
+  if (subcommand === "clean" && !dryRun
+    && options.some((value) => value === "--force" || /^-[a-z]*f[a-z]*$/.test(value))) return "git_clean_force";
+  if ((subcommand === "checkout" || subcommand === "restore")
+    && rest.some((value) => /^\.(?:[\\/])?$/.test(value))) return "git_checkout_dot";
+  if (subcommand === "branch" && options.some((value) => ["-d", "--delete"].includes(value))) return "git_branch_delete";
+  if (subcommand === "stash") {
+    const action = rest.find((value) => !value.startsWith("-"));
+    if (["drop", "clear"].includes(action)) return "git_stash_wipe";
+  }
   return undefined;
 }
 
@@ -362,13 +388,13 @@ function bashDelete(words) {
   for (const word of words.slice(1)) {
     const value = word.value;
     const lower = value.toLowerCase();
-    if (word.dynamic) return opaqueResult();
     if (options && lower === "--") {
       options = false;
       continue;
     }
     if (options && value.startsWith("-")) {
-      if (lower.startsWith("--rec") || (!lower.startsWith("--") && lower.slice(1).includes("r"))) recursive = true;
+      if (!word.dynamic
+        && (lower.startsWith("--rec") || (!lower.startsWith("--") && lower.slice(1).includes("r")))) recursive = true;
       continue;
     }
     targets.push(word);
@@ -381,20 +407,20 @@ function bashDelete(words) {
 function cmdDelete(words) {
   const first = words[0].value.toLowerCase().replace(/^@+/, "");
   const inlineOptions = first.replace(/^(?:del|erase|rmdir|rd)/, "").split("/").filter(Boolean).map((value) => `/${value}`);
-  const args = inlineOptions.length ? inlineOptions.map((value) => ({ value, dynamic: false, quoted: false, singleQuoted: false })) : [];
+  const args = inlineOptions.length
+    ? inlineOptions.map((value) => ({ value, dynamic: false, quoted: false, singleQuoted: false }))
+    : [];
   args.push(...words.slice(1));
   let recursive = false;
   const targets = [];
   for (const word of args) {
     const value = word.value;
     if (value.startsWith("/")) {
-      if (word.dynamic) return opaqueResult();
-      if (/^\/s$/i.test(value)) recursive = true;
+      if (value.split("/").some((option) => option.toLowerCase() === "s")) recursive = true;
       continue;
     }
     targets.push(word);
   }
-  if (targets.some((word) => word.dynamic && !safeTarget(word))) return opaqueResult();
   if (!recursive) return noDelete();
   if (!targets.length) return deleteResult(false);
   return deleteResult(targets.every(safeTarget));
@@ -406,9 +432,14 @@ function powershellRecurseFlag(value) {
   return powershellRecurseNames.has(flag) || (/^-[a-z]{2,3}$/.test(flag) && flag.includes("r"));
 }
 
+function powershellPreviewFlag(value) {
+  const [flag, state] = value.toLowerCase().split(":", 2);
+  return powershellPreviewNames.has(flag) && !["$false", "false", "0"].includes(state);
+}
+
 function powershellDelete(words) {
   let recursive = false;
-  let opaque = false;
+  let malformed = false;
   const targets = [];
   const args = words.slice(1);
   for (let index = 0; index < args.length; index += 1) {
@@ -416,108 +447,264 @@ function powershellDelete(words) {
     const value = word.value;
     const lower = value.toLowerCase();
     if (lower.startsWith("-")) {
-      opaque ||= word.dynamic;
+      if (powershellPreviewFlag(lower)) return noDelete();
       if (powershellRecurseFlag(lower)) recursive = true;
       const flag = lower.split(":", 1)[0];
       if (powershellPathOptions.has(flag)) {
         const next = args[index + 1];
-        if (!next) return deleteResult(false);
+        if (!next || next.value.startsWith("-")) {
+          malformed = true;
+          continue;
+        }
         targets.push(...splitPowerShellTargets(next));
         index += 1;
       } else if (powershellValueOptions.has(flag)) {
-        if (!args[index + 1]) return deleteResult(false);
-        if (["-include", "-exclude", "-filter"].includes(flag)) opaque = true;
+        const next = args[index + 1];
+        if (!next || next.value.startsWith("-")) {
+          malformed = true;
+          continue;
+        }
         index += 1;
       }
       continue;
     }
     targets.push(...splitPowerShellTargets(word));
   }
-  if (targets.some((word) => word.dynamic && !safeTarget(word))) opaque = true;
-  if (valueHasSplat(words)) opaque = true;
-  if (opaque) return opaqueResult();
   if (!recursive) return noDelete();
-  if (!targets.length) return deleteResult(false);
+  if (malformed || !targets.length) return deleteResult(false);
   return deleteResult(targets.every(safeTarget));
 }
 
-function valueHasSplat(words) {
-  return words.slice(1).some((word) => word.value.startsWith("@"));
+function bashSubstitutionEnd(source, start, kind) {
+  if (kind === "backtick") {
+    for (let index = start + 1; index < source.length; index += 1) {
+      if (source[index] === "\\") {
+        index += 1;
+      } else if (source[index] === "`") {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  let parentheses = 1;
+  let quote = "";
+  for (let index = start + 2; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (character === "\\" && quote === '"') {
+        index += 1;
+      } else if (character === quote) {
+        quote = "";
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+    } else if (character === "\\") {
+      index += 1;
+    } else if (character === "(" && source[index - 1] === "$") {
+      parentheses += 1;
+    } else if (character === ")") {
+      parentheses -= 1;
+      if (!parentheses) return index;
+    }
+  }
+  return -1;
+}
+
+function bashHereDocSpec(source, start) {
+  let index = start + 2;
+  const stripTabs = source[index] === "-";
+  if (stripTabs) index += 1;
+  while (/[ \t]/.test(source[index] ?? "")) index += 1;
+  if (index >= source.length || source[index] === "\n") return undefined;
+
+  let delimiter;
+  if (source[index] === "'" || source[index] === '"') {
+    const quote = source[index++];
+    const begin = index;
+    while (index < source.length && source[index] !== quote) index += 1;
+    if (index >= source.length) return undefined;
+    delimiter = source.slice(begin, index);
+  } else {
+    const begin = index;
+    while (index < source.length && !/[ \t\r\n;|&<>]/.test(source[index])) index += 1;
+    delimiter = source.slice(begin, index);
+  }
+  if (!delimiter) return undefined;
+  const headerEnd = source.indexOf("\n", index);
+  return { delimiter, stripTabs, headerEnd, bodyStart: headerEnd < 0 ? source.length : headerEnd + 1 };
+}
+
+function hasAnotherBashHereDoc(source, start, headerEnd) {
+  if (headerEnd < 0) return false;
+  let quote = "";
+  for (let index = start + 2; index < headerEnd; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (character === "\\" && quote === '"') index += 1;
+      else if (character === quote) quote = "";
+      continue;
+    }
+    if (character === "'" || character === '"') quote = character;
+    else if (character === "\\") index += 1;
+    else if (source.startsWith("<<", index) && source[index + 2] !== "<") return true;
+  }
+  return false;
+}
+
+function maskBashHereDocs(source) {
+  const chars = source.split("");
+  let quote = "";
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (character === "\\" && quote === '"') index += 1;
+      else if (character === quote) quote = "";
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+    } else if (character === "\\") {
+      index += 1;
+    } else if (source.startsWith("<<", index) && source[index + 2] !== "<") {
+      const spec = bashHereDocSpec(source, index);
+      if (!spec) continue;
+      if (hasAnotherBashHereDoc(source, index, spec.headerEnd)) {
+        // Multiple pending heredocs need shell-order semantics; skip the rest rather than reading data as commands.
+        for (let cursor = spec.bodyStart; cursor < source.length; cursor += 1) {
+          if (chars[cursor] !== "\n") chars[cursor] = " ";
+        }
+        break;
+      }
+      let lineStart = spec.bodyStart;
+      let terminatorStart = -1;
+      let terminatorEnd = source.length;
+      while (lineStart < source.length) {
+        const lineEnd = source.indexOf("\n", lineStart);
+        const end = lineEnd < 0 ? source.length : lineEnd;
+        let candidate = source.slice(lineStart, end).replace(/\r$/, "");
+        if (spec.stripTabs) candidate = candidate.replace(/^\t+/, "");
+        if (candidate === spec.delimiter) {
+          terminatorStart = lineStart;
+          terminatorEnd = lineEnd < 0 ? source.length : lineEnd + 1;
+          break;
+        }
+        if (lineEnd < 0) break;
+        lineStart = lineEnd + 1;
+      }
+      const maskEnd = terminatorStart < 0 ? source.length : terminatorEnd;
+      for (let cursor = spec.bodyStart; cursor < maskEnd; cursor += 1) {
+        if (chars[cursor] !== "\n") chars[cursor] = " ";
+      }
+      if (terminatorStart < 0) break;
+      index = terminatorEnd - 1;
+    }
+  }
+  return chars.join("");
+}
+
+function inspectBashSubstitutions(source, depth) {
+  let result = noDelete();
+  let quote = "";
+  let wordStart = true;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (character === "\\" && quote === '"') {
+        index += 1;
+        continue;
+      }
+      if (character === quote) {
+        quote = "";
+        continue;
+      }
+      if (quote === '"' && source.startsWith("$(", index)) {
+        const end = bashSubstitutionEnd(source, index, "dollar");
+        if (end < 0) break;
+        result = mergeResults(result, inspectSource(source.slice(index + 2, end), "bash", depth + 1));
+        index = end;
+      } else if (quote === '"' && character === "`") {
+        const end = bashSubstitutionEnd(source, index, "backtick");
+        if (end < 0) break;
+        result = mergeResults(result, inspectSource(source.slice(index + 1, end), "bash", depth + 1));
+        index = end;
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      wordStart = false;
+    } else if (character === "#" && wordStart) {
+      while (index < source.length && source[index] !== "\n") index += 1;
+      wordStart = true;
+    } else if (character === "\\") {
+      index += 1;
+      wordStart = false;
+    } else if (";|&\n".includes(character)) {
+      wordStart = true;
+    } else if (/\s/.test(character)) {
+      wordStart = true;
+    } else if (source.startsWith("$(", index)) {
+      const end = bashSubstitutionEnd(source, index, "dollar");
+      if (end < 0) break;
+      result = mergeResults(result, inspectSource(source.slice(index + 2, end), "bash", depth + 1));
+      index = end;
+      wordStart = false;
+    } else if (character === "`") {
+      const end = bashSubstitutionEnd(source, index, "backtick");
+      if (end < 0) break;
+      result = mergeResults(result, inspectSource(source.slice(index + 1, end), "bash", depth + 1));
+      index = end;
+      wordStart = false;
+    } else if ((character === "<" || character === ">") && source[index + 1] === "(") {
+      const end = bashSubstitutionEnd(source, index + 1, "dollar");
+      if (end < 0) break;
+      result = mergeResults(result, inspectSource(source.slice(index + 2, end), "bash", depth + 1));
+      index = end;
+      wordStart = false;
+    } else {
+      wordStart = false;
+    }
+  }
+  return result;
 }
 
 function inspectWords(words, dialect, depth = 0) {
-  if (depth > MAX_ANALYSIS_DEPTH) return opaqueResult();
+  if (depth > MAX_ANALYSIS_DEPTH) return noDelete();
   let commandWords = words;
-  let hasShellStartupAssignment = false;
   if (dialect === "bash") {
     let index = 0;
-    while (index < commandWords.length && /^[a-z_][a-z0-9_]*\+?=/i.test(commandWords[index].value)) {
-      if (hasUnsafeExpansion(commandWords[index], dialect)) return opaqueResult();
-      const assignmentName = /^([a-z_][a-z0-9_]*)\+?=/i.exec(commandWords[index].value)?.[1];
-      hasShellStartupAssignment ||= ["BASH_ENV", "ENV"].includes(assignmentName);
-      index += 1;
-    }
+    while (index < commandWords.length && /^[a-z_][a-z0-9_]*\+?=/i.test(commandWords[index].value)) index += 1;
     commandWords = commandWords.slice(index);
   }
   if (dialect === "cmd" && commandWords[0]?.value.startsWith("@")) {
     commandWords = [{ ...commandWords[0], value: commandWords[0].value.replace(/^@+/, "") }, ...commandWords.slice(1)];
   }
-  if (!commandWords.length) return hasShellStartupAssignment ? opaqueResult() : noDelete();
-  if (commandWords[0].dynamic) return opaqueResult();
+  if (!commandWords.length || commandWords[0].dynamic) return noDelete();
 
   const name = commandName(commandWords[0], dialect);
-  if (hasShellStartupAssignment) return opaqueResult();
-  if (dialect === "bash" && ["export", "declare", "typeset", "readonly"].includes(name)
-    && commandWords.slice(1).some((word) => isStartupVariable(word.value))) return opaqueResult();
-  if (dialect === "bash" && ["declare", "typeset"].includes(name)
-    && commandWords.slice(1).some((word) => /^-[^-]*n/.test(word.value))) return opaqueResult();
-  if (dialect === "bash" && name === "printf") {
-    const printfArgs = commandWords.slice(1);
-    const formatIndex = printfArgs[0]?.value === "--" ? 1 : 0;
-    if (printfArgs[0]?.value === "-v" || printfArgs[0]?.value.startsWith("-v")
-      || printfArgs[formatIndex]?.dynamic) return opaqueResult();
+  if (dialect === "bash" && bashControlCommands.has(name)) return inspectBashControl(commandWords, depth);
+  if (bashShells.has(name) || ["cmd", "powershell", "pwsh"].includes(name)) {
+    return inspectShellWrapper(commandWords, name === "pwsh" ? "powershell" : name, depth);
   }
-  if (dialect === "bash" && name === "read"
-    && commandWords.slice(1).some((word) => isStartupVariable(word.value))) return opaqueResult();
-  if (controlCommands.has(name)) {
-    return dialect === "bash" && bashControlCommands.has(name)
-      ? inspectBashControl(commandWords, depth)
-      : opaqueResult();
-  }
-  if (["eval", "source", ".", "xargs", "trap", "alias", "unalias"].includes(name)) return opaqueResult();
-  if (name === "find") {
-    if (commandWords.slice(1).some((word) => ["-delete", "-exec", "-execdir"].includes(word.value.toLowerCase()))) return opaqueResult();
-    if (commandWords.slice(1).some((word) => word.dynamic)) return opaqueResult();
-  }
-  if (["node", "nodejs", "python", "python3", "perl", "ruby"].includes(name)) {
-    if (commandWords.slice(1).some((word) => word.dynamic)) return opaqueResult();
-    if (commandWords.slice(1).some((word) => ["-c", "-e", "--eval"].includes(word.value.toLowerCase()))) return opaqueResult();
-  }
-  if (dialect === "powershell" && ["invoke-expression", "iex"].includes(name)) return opaqueResult();
-  if (dialect === "bash" && name === "bash") return inspectBashWrapper(commandWords, depth);
-  if (["bash", "sh", "dash", "zsh"].includes(name)) return opaqueResult();
-  if (["cmd", "powershell", "pwsh"].includes(name)) return opaqueResult();
-  if (["command", "builtin", "exec", "nohup", "sudo", "doas", "env", "busybox", "time"].includes(name)) return opaqueResult();
   if (name === "git") {
     const rule = gitRule(commandWords);
-    return rule === "opaque" ? opaqueResult() : rule ? blockedResult(rule) : noDelete();
+    return rule ? blockedResult(rule) : noDelete();
   }
   if (dialect === "bash" && name === "rm") return bashDelete(commandWords);
   if (dialect === "cmd" && cmdDeletes.has(name)) return cmdDelete(commandWords);
   if (dialect === "powershell" && powershellDeletes.has(name)) return powershellDelete(commandWords);
-  if (!commandWords.some((word) => word.dynamic)) return noDelete();
-  if (dialect === "bash" && bashDataOnlyCommands.has(name)
-    && commandWords.slice(1).every((word) => !hasUnsafeExpansion(word, dialect))) return noDelete();
-  return opaqueResult();
+  return noDelete();
 }
 
 function inspectSource(source, dialect, depth = 0) {
-  if (depth > MAX_ANALYSIS_DEPTH) return opaqueResult();
-  const { groups, opaqueSyntax } = lex(source, dialect);
-  let result = noDelete();
+  if (depth > MAX_ANALYSIS_DEPTH) return noDelete();
+  const analyzedSource = dialect === "bash" ? maskBashHereDocs(source) : source;
+  let result = dialect === "bash" ? inspectBashSubstitutions(analyzedSource, depth) : noDelete();
+  const { groups } = lex(analyzedSource, dialect);
   for (const group of groups) result = mergeResults(result, inspectWords(group, dialect, depth));
-  if (opaqueSyntax) result.opaque = true;
-  if (result.hasDelete && groups.length !== 1) result.deleteOnly = false;
   return result;
 }
 
@@ -548,11 +735,11 @@ const dialect = ["powershell", "pwsh"].includes(tool)
 try {
   const result = inspectSource(command, dialect);
   if (result.blocked) deny(result.blocked, gitAdvice);
-  if (result.opaque) deny("opaque_command", "Command safety could not be proven by static analysis; request manual review.");
   if (result.hasDelete) {
-    if (result.safe && result.deleteOnly) decision("allow", "all targets are throwaway temp/build/test artifacts");
+    if (result.safe) decision("allow", "all targets are throwaway temp/build/test artifacts");
     else deny("recursive_delete", deleteAdvice);
   }
 } catch {
-  deny("opaque_command", "Command safety could not be proven by static analysis; request manual review.");
+  // This is an accident guard, not a shell interpreter. Unknown syntax passes through.
+  process.exit(0);
 }

@@ -167,10 +167,10 @@ The plugin also accepts the legacy `{ "decision": "block", "reason": "..." }` sh
 | ID | Event | Tools | Default timeout | Purpose |
 |----|-------|-------|-----------------|---------|
 | `secret-guard` | `tool_call` | `bash`, `powershell`, `write`, `edit` | 5s | Blocks recognized API keys, tokens, private keys, and credential URLs. |
-| `destructive-command-guard` | `tool_call` | `bash`, `powershell`, `cmd` | 5s | Blocks destructive Git operations and unsafe recursive deletion; allows recognized disposable targets. |
+| `destructive-command-guard` | `tool_call` | `bash`, `powershell`, `cmd` | 5s | Best-effort guard for recognized destructive Git operations and unsafe recursive deletion; allows recognized disposable targets. |
 | `syntax-format-check` | `tool_result` | `write`, `edit` | 10s | Checks JavaScript, JSON, shell, and Python syntax; runs local Prettier when available. |
 
-The destructive guard allows simple Bash variable expansion in explicitly data-only commands such as `echo` and `printf`, literal Bash `-c` bodies, and supported Bash control groups when no destructive operation is found. Dynamic predicate expressions, executable substitutions (`$()`, backticks, process substitution), dynamic command names or arguments for other commands, external shell scripts, and unsupported syntax remain subject to manual review.
+The destructive guard is a best-effort accident guard, not a security boundary. It blocks only recognized destructive Git operations and explicit recursive deletion whose targets are not known disposable artifacts. Unknown commands, and dynamic commands or arguments that are not part of a recognized recursive deletion, pass through; unsupported shell syntax, external scripts, and parser uncertainty also pass through. The Git checks cover common forms such as forced push, `reset --hard`, forced `clean`, checkout/restore of `.`, branch deletion, and stash drop/clear; Git preview forms such as `clean -n` and `push --dry-run` are allowed. Literal shell wrappers and command substitutions are inspected when their contents can be read. PowerShell `-WhatIf` and non-recursive deletion are not blocked. Cmd control-flow bodies are not inspected; when a Bash command declares multiple pending heredocs, the guard skips the remaining source instead of interpreting it.
 
 Disable or re-enable a bundled hook with a minimal override:
 
