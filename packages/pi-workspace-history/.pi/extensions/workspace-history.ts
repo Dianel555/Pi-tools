@@ -124,7 +124,7 @@ interface RuntimeState {
   baselineWarmupPromise?: Promise<void>;
   baselineWarmupGeneration?: number;
   baselineWarmupInProgress?: boolean;
-  cachedGitignoreSource?: string;
+  cachedSnapshotIgnoreKey?: string;
   cachedSnapshotIgnoreMatcher?: Ignore;
   cachedExcludeSource?: string;
   snapshotWritePromise?: Promise<unknown>;
@@ -151,6 +151,7 @@ interface WorkspaceHistorySettings {
   maxScanDirs: number;
   maxScanMs: number;
   gitTimeoutMs: number;
+  excludePatterns: string[];
 }
 
 interface WorkspaceHistoryAvailability {
@@ -215,6 +216,11 @@ interface StorageLockOwner {
   heartbeatAt: string;
 }
 
+// Paths that are large, regenerable, and never source. A project without a
+// .gitignore has nothing else shielding them from the shadow repo, so the
+// defaults have to carry their own weight rather than lean on the project's.
+// Deliberately omits target/vendor/out: those are real source trees in some
+// ecosystems, and over-excluding silently drops files from history.
 const DEFAULT_EXCLUDES = [
   ".git",
   ".pi/workspace-history",
@@ -227,6 +233,20 @@ const DEFAULT_EXCLUDES = [
   "coverage",
   ".env",
   ".env.*",
+  "tmp",
+  "temp",
+  "logs",
+  "*.log",
+  "__pycache__",
+  "*.pyc",
+  ".venv",
+  "venv",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".ruff_cache",
+  ".gradle",
+  ".idea",
+  ".DS_Store",
 ];
 
 const WINDOWS_RESERVED_BASENAMES = new Set([
@@ -375,6 +395,16 @@ function normalizeEnabled(value: unknown): boolean | "auto" {
   return value === true || value === false ? value : "auto";
 }
 
+function normalizeExcludePatterns(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((pattern): pattern is string => typeof pattern === "string")
+    .map((pattern) => pattern.trim())
+    .filter((pattern) => pattern.length > 0);
+}
+
 async function pathExists(filePath: string): Promise<boolean> {
   try {
     await access(filePath);
@@ -459,6 +489,7 @@ async function loadWorkspaceHistorySettings(
       config.gitTimeoutMs,
       DEFAULT_GIT_TIMEOUT_MS,
     ),
+    excludePatterns: normalizeExcludePatterns(config.excludePatterns),
   };
 }
 
@@ -1428,10 +1459,12 @@ async function getSnapshotIgnoreMatcher(
 ): Promise<Ignore> {
   const gitignorePath = path.join(ctx.cwd, ".gitignore");
   const gitignoreSource = await readFile(gitignorePath, "utf8").catch(() => "");
+  const { excludePatterns } = await getWorkspaceHistorySettings(ctx, state);
+  const cacheKey = `${excludePatterns.join("\n")}\0${gitignoreSource}`;
 
   if (
     state?.cachedSnapshotIgnoreMatcher &&
-    state.cachedGitignoreSource === gitignoreSource
+    state.cachedSnapshotIgnoreKey === cacheKey
   ) {
     return state.cachedSnapshotIgnoreMatcher;
   }
@@ -1442,9 +1475,10 @@ async function getSnapshotIgnoreMatcher(
   if (gitignoreSource.trim().length > 0) {
     matcher.add(gitignoreSource);
   }
+  matcher.add(excludePatterns);
 
   if (state) {
-    state.cachedGitignoreSource = gitignoreSource;
+    state.cachedSnapshotIgnoreKey = cacheKey;
     state.cachedSnapshotIgnoreMatcher = matcher;
   }
 
@@ -1563,11 +1597,13 @@ async function syncShadowRepoExclude(
     path.join(ctx.cwd, ".gitignore"),
     "utf8",
   ).catch(() => "");
+  const { excludePatterns } = await getWorkspaceHistorySettings(ctx, state);
   const excludePath = path.join(paths.shadowGitDir, "info", "exclude");
   const excludeSource = [
     ...DEFAULT_EXCLUDES.map(normalizeSnapshotPath),
     ...getWindowsReservedIgnorePatterns(),
     gitignoreSource.trim().length > 0 ? gitignoreSource.trimEnd() : "",
+    ...excludePatterns.map(normalizeSnapshotPath),
   ]
     .filter((part) => part.length > 0)
     .join("\n");
@@ -1985,6 +2021,132 @@ async function createSnapshotCommit(
   });
 }
 
+// Case-insensitive on Windows/macOS: a `Dist` exclude must still match a
+// `dist/out.js` tree entry, or the path silently misses its backup and
+// `reset --hard` overwrites it.
+const SNAPSHOT_PATHS_ARE_CASE_SENSITIVE = process.platform === "linux";
+
+function snapshotPathKey(relativePath: string): string {
+  const normalized = normalizeSnapshotPath(relativePath);
+  return SNAPSHOT_PATHS_ARE_CASE_SENSITIVE ? normalized : normalized.toLowerCase();
+}
+
+export function selectPathsTrackedInCommit(
+  protectedPaths: string[],
+  commitTreePaths: string[],
+): string[] {
+  if (protectedPaths.length === 0 || commitTreePaths.length === 0) {
+    return [];
+  }
+
+  // Index every tree entry plus its ancestor directories, so an excluded
+  // directory is one lookup instead of a scan over the whole tree.
+  const tracked = new Set<string>();
+  for (const treePath of commitTreePaths) {
+    const key = snapshotPathKey(treePath);
+    tracked.add(key);
+    for (let slash = key.indexOf("/"); slash > 0; slash = key.indexOf("/", slash + 1)) {
+      tracked.add(key.slice(0, slash));
+    }
+  }
+  return protectedPaths.filter((relativePath) =>
+    tracked.has(snapshotPathKey(relativePath)),
+  );
+}
+
+async function listCommitTreePaths(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  commit: string,
+  state?: RuntimeState,
+): Promise<string[]> {
+  const output = await execGit(
+    pi,
+    ctx,
+    await gitArgs(ctx, state, "ls-tree", "-r", "-z", "--name-only", commit),
+    true,
+  );
+  return parseNullSeparatedPaths(output);
+}
+
+async function listIndexedPaths(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  state?: RuntimeState,
+): Promise<string[]> {
+  const output = await execGit(
+    pi,
+    ctx,
+    await gitArgs(ctx, state, "ls-files", "-z", "--cached"),
+    true,
+  );
+  return parseNullSeparatedPaths(output);
+}
+
+/**
+ * Collapse excluded paths into the shortest set of `clean -e` guards. Adding one
+ * ignore rule can pull tens of thousands of previously-tracked files into the
+ * excluded set, and `-e` lives in argv, which Windows caps at ~32k chars.
+ * Dropping a guard is safe-ish (info/exclude still covers it) but silent, so the
+ * caller logs the drop count.
+ */
+export function collapseCleanExcludeGuards(
+  excludedPaths: string[],
+  maxChars = 8_000,
+): { guards: string[]; dropped: number } {
+  const normalized = [
+    ...new Set(excludedPaths.map(normalizeSnapshotPath)),
+  ].sort();
+  const roots: string[] = [];
+  let budget = 0;
+  let dropped = 0;
+
+  for (const candidate of normalized) {
+    // Sorted order puts any ancestor immediately before its descendants, so the
+    // last kept root is the only one that can cover this candidate.
+    const parent = roots[roots.length - 1];
+    if (parent !== undefined && snapshotPathKey(candidate).startsWith(`${snapshotPathKey(parent)}/`)) {
+      continue;
+    }
+    const cost = candidate.length + 3;
+    if (budget + cost > maxChars) {
+      dropped += 1;
+      continue;
+    }
+    budget += cost;
+    roots.push(candidate);
+  }
+
+  return { guards: roots, dropped };
+}
+
+/**
+ * Excluded paths that `reset --hard <commit>` could still write to: anything the
+ * target commit materializes, plus anything the *current index* tracks (that one
+ * gets deleted rather than overwritten). Callers that skip
+ * `pruneShadowIndexForIgnoreChanges` — the rollback path — rely on the second set.
+ */
+async function selectPathsNeedingBackup(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  commit: string,
+  excludedPaths: string[],
+  state?: RuntimeState,
+): Promise<string[]> {
+  if (excludedPaths.length === 0) {
+    return [];
+  }
+  // Fail open: if git cannot tell us what is at risk, back up everything.
+  const atRisk = await Promise.all([
+    listCommitTreePaths(pi, ctx, commit, state).catch(() => undefined),
+    listIndexedPaths(pi, ctx, state).catch(() => undefined),
+  ]);
+  if (atRisk.some((paths) => paths === undefined)) {
+    return excludedPaths;
+  }
+  return selectPathsTrackedInCommit(excludedPaths, atRisk.flat() as string[]);
+}
+
 async function restoreSnapshotCommit(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -1993,7 +2155,24 @@ async function restoreSnapshotCommit(
 ): Promise<void> {
   await assertWorkspaceHistoryEnabled(ctx, state, "restoreSnapshotCommit");
   await ensureShadowRepo(pi, ctx, state);
-  const protectedPaths = state?.lastExcludedWorkspacePaths ?? [];
+  const excludedPaths = state?.lastExcludedWorkspacePaths ?? [];
+  // `clean -fd` (no -x) and info/exclude already protect ignored paths, so only paths
+  // `reset --hard` could actually touch need a backup round-trip.
+  // ponytail: whole-directory copy; a 500MB node_modules in the commit tree still costs
+  // a full cp. Narrow to the individual tracked paths if that ever shows up in practice.
+  const protectedPaths = await selectPathsNeedingBackup(
+    pi,
+    ctx,
+    commit,
+    excludedPaths,
+    state,
+  );
+  const cleanGuards = collapseCleanExcludeGuards(excludedPaths);
+  await logLine(
+    ctx,
+    `restore backup scope commit=${commit} excluded=${excludedPaths.length} backed-up=${protectedPaths.length} guards=${cleanGuards.guards.length} guards-dropped=${cleanGuards.dropped}`,
+    state,
+  );
   const excludedBackupDir = path.join(
     (await getWorkspaceStoragePaths(ctx, state)).sessionRoot,
     `excluded-backup-${Date.now()}-${Math.random().toString(36).slice(2)}`,
@@ -2029,10 +2208,10 @@ async function restoreSnapshotCommit(
         state,
         "clean",
         "-fd",
-        ...protectedPaths.flatMap((relativePath) => [
-          "-e",
-          normalizeSnapshotPath(relativePath),
-        ]),
+        // Guard every excluded path, not just the backed-up subset: these are the
+        // last line of defence if info/exclude ever goes out of sync. Collapsed to
+        // ancestor roots so the guard set cannot overflow argv.
+        ...cleanGuards.guards.flatMap((relativePath) => ["-e", relativePath]),
         "--",
         ".",
       ),
@@ -2063,7 +2242,7 @@ async function restoreSnapshotCommitSafely(
   ctx: ExtensionContext,
   targetCommit: string,
   state?: RuntimeState,
-): Promise<void> {
+): Promise<string> {
   await assertWorkspaceHistoryEnabled(
     ctx,
     state,
@@ -2078,9 +2257,8 @@ async function restoreSnapshotCommitSafely(
 
   try {
     await restoreSnapshotCommit(pi, ctx, targetCommit, state);
-    await touchWorkspaceAndSessionMeta(ctx, state);
-    scheduleCleanup(ctx, state);
   } catch (error) {
+    // The restore itself failed, so the workspace is half-written: roll back.
     try {
       await restoreSnapshotCommit(pi, ctx, rollbackCommit, state);
     } catch (rollbackError) {
@@ -2090,6 +2268,13 @@ async function restoreSnapshotCommitSafely(
     }
     throw error;
   }
+
+  // Restore succeeded; the files are on disk. Metadata/cleanup are best-effort —
+  // a failure here (e.g. a stale ctx after /reload) must not trigger the rollback
+  // above, which would silently undo a completed restore.
+  await touchWorkspaceAndSessionMeta(ctx, state).catch(() => undefined);
+  scheduleCleanup(ctx, state);
+  return rollbackCommit;
 }
 
 async function readRedoState(
@@ -2744,18 +2929,27 @@ async function restoreResolvedSnapshot(
   targetId: string,
   snapshot: WorkspaceSnapshot | CustomEntry<WorkspaceSnapshot>,
   state?: RuntimeState,
-): Promise<void> {
+): Promise<string> {
   const snapshotData = getResolvedSnapshotData(snapshot);
   if (!snapshotData) {
     throw new Error("snapshot data missing");
   }
 
-  await restoreSnapshotCommitSafely(pi, ctx, snapshotData.commit, state);
+  const rollbackCommit = await restoreSnapshotCommitSafely(
+    pi,
+    ctx,
+    snapshotData.commit,
+    state,
+  );
+  // The files are already on disk: a logging failure here (stale ctx after a
+  // /reload during the restore) must not read as "restore failed", or the caller
+  // returns without the rollback commit and leaves the tree behind the files.
   await logLine(
     ctx,
     `restore source=${source} target=${targetId} kind=${snapshotData.kind} commit=${snapshotData.commit} ok`,
     state,
-  );
+  ).catch(() => undefined);
+  return rollbackCommit;
 }
 
 const CLEANUP_INTERVAL_MS = 60_000;
@@ -2778,6 +2972,23 @@ function scheduleCleanup(ctx: ExtensionContext, state?: RuntimeState): void {
     .finally(() => {
       state.cleanupPromise = undefined;
     });
+}
+
+/**
+ * Notify through a ctx that may have been invalidated by a session replacement
+ * or /reload while a long-running command was awaiting. Every ctx member is a
+ * guarded getter, so touching `ctx.ui` on a dead ctx throws.
+ */
+function notifyIfLive(
+  ctx: ExtensionContext,
+  message: string,
+  level: "info" | "warning" | "error",
+): void {
+  try {
+    ctx.ui.notify(message, level);
+  } catch {
+    // ctx is stale; the TUI it belonged to is already gone.
+  }
 }
 
 async function ensureNoUnsnapshottedChanges(
@@ -3600,8 +3811,9 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     }
 
     // Restore workspace files
+    let rollbackCommit: string;
     try {
-      await restoreResolvedSnapshot(
+      rollbackCommit = await restoreResolvedSnapshot(
         pi,
         ctx,
         "rewind",
@@ -3610,17 +3822,101 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
         state,
       );
     } catch {
-      ctx.ui.notify("Workspace restore failed.", "error");
+      notifyIfLive(ctx, "Workspace restore failed.", "error");
       return;
     }
 
-    // Navigate
-    const result = await ctx.navigateTree(targetId, { summarize: false });
-    if (result.cancelled) {
-      ctx.ui.notify("Rewind cancelled.", "info");
+    // Navigate. Files are already restored, so a failure here would leave the
+    // workspace and the session tree out of sync: roll the files back instead.
+    await logLine(ctx, `rewind navigate start target=${targetId}`, state).catch(
+      () => undefined,
+    );
+    try {
+      const result = await ctx.navigateTree(targetId, { summarize: false });
+      if (result.cancelled) {
+        await undoRestoredFiles(pi, ctx, state, rollbackCommit, "cancelled");
+        return;
+      }
+    } catch (error) {
+      // navigateTree throws on both sides of its commit. The leaf move
+      // (sessionManager.branch) lands before buildSessionContext / the
+      // session_tree emit / the UI refresh, any of which can still throw
+      // (e.g. a /reload swapping the runtime mid-await). A post-commit throw
+      // must NOT roll the files back — that would leave files on the old
+      // snapshot while the tree points at the target (reverse desync). The
+      // leaf pointer is the only observable commit signal: roll back only when
+      // it is unchanged, i.e. the failure was pre-commit.
+      let committed = false;
+      try {
+        committed = ctx.sessionManager.getLeafId() !== currentLeafId;
+      } catch {
+        // ctx is stale; getLeafId throws. A stale ctx also fails the rollback's
+        // pi.exec, so falling through to undoRestoredFiles is harmless.
+      }
+      if (committed) {
+        await logLine(
+          ctx,
+          `rewind navigate committed-then-threw target=${targetId} error=${String(error)}`,
+          state,
+        ).catch(() => undefined);
+        notifyIfLive(
+          ctx,
+          "Rewind navigated, but a post-navigation step failed. Workspace is on the rewind target.",
+          "warning",
+        );
+        return;
+      }
+      await undoRestoredFiles(
+        pi,
+        ctx,
+        state,
+        rollbackCommit,
+        `failed error=${String(error)}`,
+      );
       return;
     }
 
-    ctx.ui.notify("Rewind complete. Workspace restored.", "info");
+    await logLine(ctx, `rewind navigate ok target=${targetId}`, state).catch(
+      () => undefined,
+    );
+    notifyIfLive(ctx, "Rewind complete. Workspace restored.", "info");
+  }
+
+  /**
+   * Put the files back after the restore succeeded but navigation did not.
+   * Both the git calls and the notification need a live ctx, so a ctx that died
+   * mid-rewind (a /reload during the restore) leaves the files on the target
+   * snapshot: say so loudly rather than failing silently.
+   */
+  async function undoRestoredFiles(
+    pi: ExtensionAPI,
+    ctx: ExtensionCommandContext,
+    state: RuntimeState,
+    rollbackCommit: string,
+    reason: string,
+  ): Promise<void> {
+    await logLine(ctx, `rewind navigate ${reason}`, state).catch(
+      () => undefined,
+    );
+    try {
+      await restoreSnapshotCommit(pi, ctx, rollbackCommit, state);
+      await logLine(
+        ctx,
+        `rewind rolled back files to ${rollbackCommit}`,
+        state,
+      ).catch(() => undefined);
+      notifyIfLive(ctx, "Rewind cancelled. Workspace unchanged.", "info");
+    } catch (error) {
+      await logLine(
+        ctx,
+        `rewind rollback failed commit=${rollbackCommit} error=${String(error)}`,
+        state,
+      ).catch(() => undefined);
+      notifyIfLive(
+        ctx,
+        `Rewind incomplete: files are on the rewind target but the session did not move. Your previous files are in shadow commit ${rollbackCommit}.`,
+        "error",
+      );
+    }
   }
 }

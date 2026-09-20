@@ -69,7 +69,8 @@ Example:
     "maxScanFiles": 20000,
     "maxScanDirs": 3000,
     "maxScanMs": 5000,
-    "gitTimeoutMs": 60000
+    "gitTimeoutMs": 60000,
+    "excludePatterns": ["*.tmp", "scratch/", "data/large/"]
   }
 }
 ```
@@ -86,6 +87,44 @@ Example:
 | `workspaceHistory.maxScanDirs` | `3000` | Maximum number of directories scanned when checking ignored/protected paths |
 | `workspaceHistory.maxScanMs` | `5000` | Maximum time spent scanning ignored/protected paths, in milliseconds |
 | `workspaceHistory.gitTimeoutMs` | `60000` | Timeout for internal Git operations, in milliseconds |
+| `workspaceHistory.excludePatterns` | `[]` | Extra paths to exclude from snapshots, in `.gitignore` syntax. Appended to the built-in defaults; see below |
+
+## Excluded Paths
+
+The plugin never snapshots large, regenerable, non-source paths, so that time-travel stays fast and history stays small. This works even in a project with **no `.gitignore` and no Git repository at all** — the defaults are built in, not read from the project.
+
+Built-in defaults: `.git`, `.pi/workspace-history`, `node_modules`, `dist`, `build`, `.cache`, `.next`, `.turbo`, `coverage`, `.env`, `.env.*`, `tmp`, `temp`, `logs`, `*.log`, `__pycache__`, `*.pyc`, `.venv`, `venv`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.gradle`, `.idea`, `.DS_Store`.
+
+If the project has a `.gitignore`, its rules are merged on top of the defaults. To exclude anything else, add `workspaceHistory.excludePatterns` (`.gitignore` syntax):
+
+```json
+{
+  "workspaceHistory": {
+    "excludePatterns": ["*.tmp", "scratch/", "data/large/"]
+  }
+}
+```
+
+Paths matched here are left untouched on disk during `/undo`, `/redo`, and `/rewind` — the plugin does not restore them, so use it only for files you are willing to keep as-is across a time-travel.
+
+## Debug Logging
+
+Logging is off by default. It is controlled by the `PI_WORKSPACE_HISTORY_LOG` **environment variable**. Accepted values are `1`, `true`, `yes`, and `on`.
+
+```powershell
+# PowerShell, before launching pi
+$env:PI_WORKSPACE_HISTORY_LOG = "1"
+pi
+```
+
+```bash
+# bash / zsh
+PI_WORKSPACE_HISTORY_LOG=1 pi
+```
+
+The log is written to `<storageDir>/logs/timemachine.log` — by default `~/.pi/agent/state/workspace-history/logs/timemachine.log`, or under `workspaceHistory.storageDir` when that is set.
+
+It records snapshot commits, Git invocations with timings, restore and navigation outcomes, and how many paths each restore had to back up. That makes it the first thing to enable when a `/rewind`, `/undo`, or `/redo` behaves unexpectedly.
 
 ## Installation and Usage
 

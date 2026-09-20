@@ -1,6 +1,6 @@
 {
   "name": "@dianel/pi-workspace-history",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Real workspace undo/redo for Pi",
   "author": "Dianel555",
   "license": "MIT",
