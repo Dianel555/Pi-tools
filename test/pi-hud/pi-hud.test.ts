@@ -84,7 +84,7 @@ assert cache.model_for("provider-a", "unknown-model") == "unknown-model"
   runPython(script, process.env);
 });
 
-test("saved HUD geometry is recentered when it leaves the virtual desktop", () => {
+test("saved HUD geometry keeps visible positions and recenters only invisible windows", () => {
   const script = `
 import sys
 sys.path.insert(0, ${JSON.stringify(packageDir)})
@@ -98,15 +98,214 @@ class FakeWindow:
 
 pi_hud._user32 = None
 window = FakeWindow()
-assert pi_hud._safe_window_position(window, 680, 100, 2500, 80) == (-340, 80)
-assert pi_hud._safe_window_position(window, 680, 100, -2500, 80) == (-340, 80)
+assert pi_hud._safe_window_position(window, 680, 100, 2500, 80) == (-340, 490)
+assert pi_hud._safe_window_position(window, 680, 100, -2500, 80) == (-2500, 80)
+assert pi_hud._safe_window_position(window, 680, 100, -2600, 80) == (-340, 490)
 assert pi_hud._safe_window_position(window, 680, 100, -1500, 80) == (-1500, 80)
 assert pi_hud._safe_window_position(window, 680, 100, 100, 100) == (100, 100)
 `;
   runPython(script, process.env);
   assert.match(pythonSource, /def _virtual_screen_bounds\(window\):/);
+  assert.match(pythonSource, /def _screen_rectangles\(window\):/);
+  assert.match(pythonSource, /EnumDisplayMonitors/);
   assert.match(pythonSource, /def _safe_window_position\(window, width, height, x, y\):/);
   assert.match(pythonSource, /self\._ensure_on_screen\(\)/);
+});
+
+test("window recovery preserves every visible edge and monitor topology", () => {
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+import pi_hud
+
+# A one-pixel intersection is still visible, including all four corners.
+screen_rectangles = pi_hud._screen_rectangles
+pi_hud._screen_rectangles = lambda _: [(0, 0, 1920, 1080)]
+visible = [
+    (-679, 0), (1919, 0), (0, -99), (0, 1079),
+    (-679, -99), (1919, -99), (-679, 1079), (1919, 1079),
+]
+for x, y in visible:
+    assert pi_hud._safe_window_position(object(), 680, 100, x, y) == (x, y), (x, y)
+assert pi_hud._safe_window_position(object(), 680, 100, -680, 0) == (620, 490)
+assert pi_hud._safe_window_position(object(), 680, 100, 1920, 0) == (620, 490)
+assert pi_hud._safe_window_position(object(), 680, 100, 0, -100) == (620, 490)
+assert pi_hud._safe_window_position(object(), 680, 100, 0, 1080) == (620, 490)
+# A window larger than the desktop remains where it was if it intersects it.
+assert pi_hud._safe_window_position(object(), 3000, 2000, -200, -200) == (-200, -200)
+
+# Gaps in an L-shaped desktop are not visible displays.
+pi_hud._screen_rectangles = lambda _: [(0, 0, 1920, 1080), (1920, 1200, 3840, 2280)]
+assert pi_hud._safe_window_position(object(), 680, 100, 2000, 100) == (620, 490)
+# A topology change makes the old monitor position recover to the remaining one.
+pi_hud._screen_rectangles = lambda _: [(0, 0, 1920, 1080), (1920, 0, 3840, 1080)]
+assert pi_hud._safe_window_position(object(), 680, 100, 2000, 100) == (2000, 100)
+pi_hud._screen_rectangles = lambda _: [(0, 0, 1920, 1080)]
+assert pi_hud._safe_window_position(object(), 680, 100, 2000, 100) == (620, 490)
+# Negative-coordinate monitors are valid display rectangles.
+pi_hud._screen_rectangles = lambda _: [(-1920, -1080, 0, 0), (0, 0, 1920, 1080)]
+assert pi_hud._safe_window_position(object(), 680, 100, -1500, -500) == (-1500, -500)
+assert pi_hud._safe_window_position(object(), 680, 100, -3000, -500) == (-1300, -590)
+# Exercise the Windows callback shape even when the suite runs elsewhere.
+import ctypes
+from ctypes import wintypes
+class WorkingUser32:
+    def EnumDisplayMonitors(self, _dc, _clip, callback, _data):
+        rect = wintypes.RECT(-1920, -1080, 0, 0)
+        callback(None, None, ctypes.pointer(rect), 0)
+        return 1
+pi_hud._MONITOR_ENUM_PROC = lambda callback: callback
+pi_hud._user32 = WorkingUser32()
+pi_hud._screen_rectangles = screen_rectangles
+assert pi_hud._screen_rectangles(object()) == [(-1920, -1080, 0, 0)]
+
+# If monitor enumeration fails, do not make a false recovery decision.
+class FailingUser32:
+    def EnumDisplayMonitors(self, *args):
+        raise OSError("monitor enumeration failed")
+pi_hud._user32 = FailingUser32()
+assert pi_hud._screen_rectangles(object()) == []
+assert pi_hud._safe_window_position(object(), 680, 100, 9000, 9000) == (9000, 9000)
+`;
+  runPython(script, process.env);
+});
+
+test("moving the HUD skips resize cleanup and remains stable in later polls", () => {
+  const script = `
+from types import SimpleNamespace
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+import pi_hud
+
+hud = pi_hud.HUD.__new__(pi_hud.HUD)
+hud._drag = {"mode": "move"}
+hud._geometry_idle = "geometry-idle"
+hud._footer_idle = "footer-idle"
+hud._pending_geometry = (999, 999, 999, 999)
+hud._alpha = 0.95
+hud._lw = 680
+hud._lh = 100
+cancelled = []
+hud.after_cancel = lambda timer: cancelled.append(timer)
+configure_events = []
+hud._sync_wraplength = lambda width=None: configure_events.append(width)
+updates = []
+def update_idletasks():
+    assert hud._drag is not None
+    pi_hud.HUD._on_config(
+        hud, SimpleNamespace(widget=hud, width=682, height=102)
+    )
+    updates.append("idletasks")
+hud.update_idletasks = update_idletasks
+calls = []
+hud.attributes = lambda *args: calls.append(("attributes", *args))
+def ensure_on_screen():
+    assert hud._drag is None
+    calls.append("ensure")
+hud._ensure_on_screen = ensure_on_screen
+hud._save_geom = lambda: calls.append("save")
+hud._apply_pending_geometry = lambda: calls.append("apply")
+hud._update_scale = lambda *args: (_ for _ in ()).throw(AssertionError("move must not rescale"))
+hud._apply_fonts = lambda: (_ for _ in ()).throw(AssertionError("move must not reapply fonts"))
+hud._sync_footer_height = lambda *args: (_ for _ in ()).throw(AssertionError("move must not relayout"))
+hud._fit_footer_window = lambda: (_ for _ in ()).throw(AssertionError("move must not fit footer"))
+pi_hud.HUD._on_release(hud, None)
+assert hud._drag is None
+assert hud._pending_geometry is None
+assert cancelled == ["geometry-idle", "footer-idle"]
+assert updates == ["idletasks"]
+assert configure_events == [682]
+assert calls == [("attributes", "-alpha", 0.95), "ensure", "save"]
+
+# Footer callbacks must also ignore a pure move, including an already queued idle.
+footer_hud = pi_hud.HUD.__new__(pi_hud.HUD)
+footer_hud._drag = {"mode": "move"}
+footer_hud._footer_idle = "queued-footer"
+footer_hud._queue_footer_sync = lambda: (_ for _ in ()).throw(AssertionError("move queued footer sync"))
+footer_hud._sync_footer_height = lambda *args: (_ for _ in ()).throw(AssertionError("move ran footer resize"))
+pi_hud.HUD._on_footer_configure(footer_hud, None)
+pi_hud.HUD._sync_footer_after_resize(footer_hud)
+assert footer_hud._footer_idle is None
+
+# The actual recovery guard must not write while a move is active, even off-screen.
+drag_hud = pi_hud.HUD.__new__(pi_hud.HUD)
+drag_hud._drag = {"mode": "move"}
+drag_hud.state = lambda: "normal"
+drag_hud.winfo_width = lambda: 680
+drag_hud.winfo_height = lambda: 100
+drag_hud.winfo_x = lambda: 9000
+drag_hud.winfo_y = lambda: 9000
+drag_hud.geometry_calls = []
+drag_hud.geometry = lambda value: drag_hud.geometry_calls.append(value)
+drag_hud._save_geom = lambda: drag_hud.geometry_calls.append("save")
+pi_hud._screen_rectangles = lambda _: [(0, 0, 1920, 1080)]
+pi_hud.HUD._ensure_on_screen(drag_hud)
+assert drag_hud.geometry_calls == []
+
+# Repeated polling/configure cycles must not rewrite a still-visible position or size.
+poll_hud = pi_hud.HUD.__new__(pi_hud.HUD)
+poll_hud._drag = None
+poll_hud.state = lambda: "normal"
+poll_hud.winfo_width = lambda: 680
+poll_hud.winfo_height = lambda: 100
+poll_hud.winfo_x = lambda: -1
+poll_hud.winfo_y = lambda: 80
+poll_hud.geometry_calls = []
+poll_hud.geometry = lambda value: poll_hud.geometry_calls.append(value)
+poll_hud._save_geom = lambda: poll_hud.geometry_calls.append("save")
+pi_hud._screen_rectangles = lambda _: [(0, 0, 1920, 1080)]
+for _ in range(3):
+    pi_hud.HUD._ensure_on_screen(poll_hud)
+assert poll_hud.geometry_calls == []
+assert (poll_hud.winfo_width(), poll_hud.winfo_height(), poll_hud.winfo_x()) == (680, 100, -1)
+poll_hud._lw = 680
+poll_hud._lh = 100
+poll_hud._update_scale = lambda *args: (_ for _ in ()).throw(AssertionError("same-size configure must be ignored"))
+poll_hud._sync_wraplength = lambda *args: None
+pi_hud.HUD._on_config(poll_hud, SimpleNamespace(widget=poll_hud, width=680, height=100))
+`;
+  runPython(script, process.env);
+});
+
+test("negative saved coordinates round-trip and minimized HUD is not repositioned", () => {
+  const script = `
+import json, sys, tempfile
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+import pi_hud
+
+pi_hud._user32 = None
+pi_hud._screen_rectangles = lambda _: [(0, 0, 1920, 1080)]
+with tempfile.TemporaryDirectory() as temp:
+    cfg = temp + "/geometry.json"
+    geometry = ["680x100+-1+-2"]
+    hud = pi_hud.HUD.__new__(pi_hud.HUD)
+    hud._theme_name = "dark"
+    def geometry_manager(value=None):
+        if value is not None:
+            geometry[0] = value
+        return geometry[0]
+    hud.geometry = geometry_manager
+    pi_hud.CFG_FILE = cfg
+    pi_hud.HUD._save_geom(hud)
+    with open(cfg, encoding="utf-8") as f:
+        assert json.load(f)["g"] == "680x100+-1+-2"
+    geometry[0] = "680x100+120+80"
+    pi_hud.HUD._load_geom(hud)
+    assert geometry[0] == "680x100+-1+-2", geometry[0]
+
+minimized = pi_hud.HUD.__new__(pi_hud.HUD)
+minimized._drag = None
+minimized.state = lambda: "iconic"
+minimized.winfo_width = lambda: 680
+minimized.winfo_height = lambda: 100
+minimized.winfo_x = lambda: 2500
+minimized.winfo_y = lambda: 80
+minimized.geometry_calls = []
+minimized.geometry = lambda value: minimized.geometry_calls.append(value)
+pi_hud.HUD._ensure_on_screen(minimized)
+assert minimized.geometry_calls == []
+`;
+  runPython(script, process.env);
 });
 
 test("manual model config overrides automatic provider mapping", () => {

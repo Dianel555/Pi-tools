@@ -22,9 +22,26 @@ from theme import C, THEMES
 if sys.platform == "win32":
     _kernel32 = ctypes.windll.kernel32
     _user32 = ctypes.windll.user32
+    from ctypes import wintypes
+
+    _MONITOR_ENUM_PROC = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HANDLE,
+        wintypes.HDC,
+        ctypes.POINTER(wintypes.RECT),
+        wintypes.LPARAM,
+    )
+    _user32.EnumDisplayMonitors.argtypes = (
+        wintypes.HDC,
+        ctypes.POINTER(wintypes.RECT),
+        _MONITOR_ENUM_PROC,
+        wintypes.LPARAM,
+    )
+    _user32.EnumDisplayMonitors.restype = wintypes.BOOL
 else:
     _kernel32 = None
     _user32 = None
+    _MONITOR_ENUM_PROC = None
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -58,19 +75,59 @@ def _virtual_screen_bounds(window):
         return (0, 0, int(window.winfo_screenwidth()), int(window.winfo_screenheight()))
 
 
+def _screen_rectangles(window):
+    """Return physical monitor rectangles, or a virtual-screen fallback."""
+    if _user32 is not None and _MONITOR_ENUM_PROC is not None:
+        rectangles = []
+        try:
+            @_MONITOR_ENUM_PROC
+            def collect(_monitor, _dc, rect, _data):
+                value = rect.contents
+                if value.right > value.left and value.bottom > value.top:
+                    rectangles.append(
+                        (
+                            int(value.left),
+                            int(value.top),
+                            int(value.right),
+                            int(value.bottom),
+                        )
+                    )
+                return True
+
+            if not _user32.EnumDisplayMonitors(None, None, collect, 0):
+                return []
+        except (AttributeError, OSError, TypeError, ValueError, ctypes.ArgumentError):
+            return []
+        return rectangles
+
+    # Non-Windows Tk exposes only the virtual bounding rectangle, so monitor
+    # gaps cannot be distinguished there; it is still the safest fallback.
+    left, top, width, height = _virtual_screen_bounds(window)
+    if width <= 0 or height <= 0:
+        return []
+    return [(left, top, left + width, top + height)]
+
+
 def _safe_window_position(window, width, height, x, y):
-    """Keep a saved position visible after monitors change."""
-    left, top, area_width, area_height = _virtual_screen_bounds(window)
-    right, bottom = left + area_width, top + area_height
-    if width > area_width:
-        x = left
-    elif x < left or x + width > right:
-        x = left + max(0, (area_width - width) // 2)
-    if height > area_height:
-        y = top
-    elif y < top or y + height > bottom:
-        y = top + max(0, (area_height - height) // 2)
-    return x, y
+    """Recenter only when the window has no visible intersection."""
+    rectangles = _screen_rectangles(window)
+    if not rectangles or any(
+        x < right
+        and x + width > left
+        and y < bottom
+        and y + height > top
+        for left, top, right, bottom in rectangles
+    ):
+        return x, y
+
+    def distance(rectangle):
+        left, top, right, bottom = rectangle
+        dx = max(left - (x + width), x - right, 0)
+        dy = max(top - (y + height), y - bottom, 0)
+        return dx * dx + dy * dy
+
+    left, top, right, bottom = min(rectangles, key=distance)
+    return left + (right - left - width) // 2, top + (bottom - top - height) // 2
 
 
 MANAGED_MODE = "--managed" in sys.argv
@@ -512,14 +569,34 @@ class HUD(tk.Tk):
     def _on_release(self, evt):
         if self._drag is None:
             return
+        was_move = self._is_move_drag()
         was_horizontal_resize = self._is_horizontal_resize()
-        self._drag = None
         if self._geometry_idle is not None:
             self.after_cancel(self._geometry_idle)
             self._geometry_idle = None
         if self._footer_idle is not None:
             self.after_cancel(self._footer_idle)
             self._footer_idle = None
+        if was_move:
+            # Keep Configure events in the drag-suppressed path and discard any
+            # stale resize queued before the move began.
+            self._pending_geometry = None
+            self.update_idletasks()
+            # A Configure callback can queue another idle callback while Tk
+            # drains the event queue; cancel those before ending the drag.
+            if self._geometry_idle is not None:
+                self.after_cancel(self._geometry_idle)
+                self._geometry_idle = None
+            if self._footer_idle is not None:
+                self.after_cancel(self._footer_idle)
+                self._footer_idle = None
+            self._pending_geometry = None
+            self._drag = None
+            self.attributes("-alpha", self._alpha)
+            self._ensure_on_screen()
+            self._save_geom()
+            return
+        self._drag = None
         if self._pending_geometry:
             self._apply_pending_geometry()
         self.update_idletasks()
@@ -545,6 +622,10 @@ class HUD(tk.Tk):
         self.geometry(f"{width}x{height}+{x}+{y}")
         self._update_scale(width, height)
 
+    def _is_move_drag(self):
+        drag = self.__dict__.get("_drag")
+        return isinstance(drag, dict) and drag.get("mode") == "move"
+
     def _is_horizontal_resize(self):
         drag = self.__dict__.get("_drag")
         drag = drag if isinstance(drag, dict) else {}
@@ -569,7 +650,7 @@ class HUD(tk.Tk):
             self.geometry(f"{width}x{height}+{x}+{y}")
 
     def _on_footer_configure(self, _):
-        if self._drag:
+        if self._drag and not self._is_move_drag():
             self._queue_footer_sync()
 
     def _queue_footer_sync(self):
@@ -578,6 +659,8 @@ class HUD(tk.Tk):
 
     def _sync_footer_after_resize(self):
         self._footer_idle = None
+        if self._is_move_drag():
+            return
         self._sync_footer_height(resizing=True)
 
     def _update_scale(self, w, h):
@@ -809,12 +892,17 @@ class HUD(tk.Tk):
 
 
     def _ensure_on_screen(self):
+        if self._drag is not None:
+            return
         try:
+            if self.state() != "normal":
+                return
             width, height = self.winfo_width(), self.winfo_height()
             x, y = self.winfo_x(), self.winfo_y()
             safe_x, safe_y = _safe_window_position(self, width, height, x, y)
             if (safe_x, safe_y) != (x, y):
-                self.geometry(f"{width}x{height}+{safe_x}+{safe_y}")
+                # Position-only geometry preserves the user-selected size.
+                self.geometry(f"+{safe_x}+{safe_y}")
                 self._save_geom()
         except (AttributeError, tk.TclError, TypeError, ValueError):
             pass
@@ -825,7 +913,7 @@ class HUD(tk.Tk):
                 value = json.load(f).get("g")
             if not isinstance(value, str):
                 return
-            match = re.fullmatch(r"(\d+)x(\d+)((?:[+-]\d+){0,2})", value)
+            match = re.fullmatch(r"(\d+)x(\d+)((?:[+-]-?\d+){0,2})", value)
             if not match:
                 return
             width = max(MIN_W, int(match.group(1)))
@@ -833,9 +921,12 @@ class HUD(tk.Tk):
             position = match.group(3)
             x, y = 120, 80
             if position:
-                parts = re.findall(r"[+-]\d+", position)
+                parts = re.findall(r"[+-]-?\d+", position)
                 if len(parts) == 2:
-                    x, y = map(int, parts)
+                    x, y = (
+                        int(part[1:] if part.startswith("+") else part)
+                        for part in parts
+                    )
             x, y = _safe_window_position(self, width, height, x, y)
             self.geometry(f"{width}x{height}+{x}+{y}")
         except (OSError, json.JSONDecodeError, AttributeError, TypeError, ValueError, tk.TclError):
