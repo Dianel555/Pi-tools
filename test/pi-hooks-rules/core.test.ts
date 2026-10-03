@@ -148,6 +148,19 @@ test("loads global rules and gates project rules behind trust markers", () => {
   }
 });
 
+test("project trust markers follow Pi's trust-requiring resources", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hooks-trust-"));
+  try {
+    mkdirSync(join(root, ".pi"), { recursive: true });
+    assert.equal(hasProjectTrustMarker(root), false);
+    // Pi 1.0 gates project mcp.json behind project trust.
+    writeFileSync(join(root, ".pi", "mcp.json"), "{}\n");
+    assert.equal(hasProjectTrustMarker(root), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("reads optional configuration and registers Pi surfaces", () => {
   assert.deepEqual(readHookFile(join(tmpdir(), "missing-pi-hooks.json"), true), {
     version: 1,

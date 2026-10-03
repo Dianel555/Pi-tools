@@ -168,7 +168,6 @@ function startHUD() {
   try {
     registerTerminal();
   } catch (err) {
-    console.error("[pi-hud] Failed to register terminal:", err);
     reportStartup(`Failed to register terminal: ${err instanceof Error ? err.message : String(err)}`);
     return;
   }
@@ -181,7 +180,6 @@ function startHUD() {
       windowsHide: true,
     });
     hudProcess.once("error", (err) => {
-      console.error("[pi-hud] HUD process failed:", err.message);
       reportStartup(`HUD process failed: ${err.message}`);
       hudProcess = null;
       scheduleStart();
@@ -191,12 +189,27 @@ function startHUD() {
       if (!shuttingDown && registered && !hudIsAlive()) scheduleStart();
     });
     hudProcess.unref();
-    console.log("[pi-hud] HUD window started (PID:", hudProcess.pid, ")");
+    reportStartup(`HUD window started (PID: ${hudProcess.pid})`);
   } catch (err) {
-    console.error("[pi-hud] Failed to start:", err);
     reportStartup(`Failed to start: ${err instanceof Error ? err.message : String(err)}`);
     hudProcess = null;
     scheduleStart();
+  }
+}
+
+const EXIT_STATE = Symbol.for("@dianel/pi-hud/exit");
+
+// Pi imports extensions without a module cache, so /reload re-evaluates this module.
+// Keep one process-wide exit listener that calls the latest instance's cleanup.
+function installExitHook() {
+  const state = (globalThis[EXIT_STATE] ??= { cleanup: null, installed: false });
+  state.cleanup = () => {
+    shuttingDown = true;
+    unregisterTerminal();
+  };
+  if (!state.installed) {
+    state.installed = true;
+    process.once("exit", () => state.cleanup?.());
   }
 }
 
@@ -211,8 +224,12 @@ export default function piHUD(pi) {
   pi.events.on("subagents:completed", (event) => persistSubagentCost(pi, event));
   pi.events.on("subagents:failed", (event) => persistSubagentCost(pi, event));
 
+  // Factories also run in invocations that never start a session, so startup,
+  // timers, and process listeners belong to session_start.
   pi.on("session_start", () => {
     persistAgentState(pi, false);
+    installExitHook();
+    startHUD();
   });
 
   pi.on("before_agent_start", () => {
@@ -232,17 +249,5 @@ export default function piHUD(pi) {
   });
 
   // session_shutdown is not the lifetime end of a Pi terminal. The shared HUD
-  // must remain available for other terminals.
-  setTimeout(startHUD, 1000);
-
-  process.on("exit", () => {
-    shuttingDown = true;
-    unregisterTerminal();
-  });
-
-  return {
-    activate: startHUD,
-    // Keep the registration through extension reload; beforeExit owns cleanup.
-    deactivate: () => {},
-  };
+  // must remain available for other terminals; the exit hook owns cleanup.
 }

@@ -490,6 +490,25 @@ assert round(cache.cost, 2) == 0.6, cache.cost
   runPython(script, process.env);
 });
 
+test("main cost includes Pi 1.0 usage entries such as cache warming", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-hud-usage-entry-"));
+  writeFileSync(
+    join(root, "session.jsonl"),
+    [
+      { type: "message", message: { role: "assistant", usage: { cost: { total: 0.1 } } } },
+      { type: "usage", kind: "cache_warm", provider: "anthropic", model: "m", usage: { cost: { total: 0.4 } } },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
+  );
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from data import SessionCache
+cache = SessionCache(${JSON.stringify(root)}, ${JSON.stringify(join(root, "models.json"))})
+assert round(cache.cost, 2) == 0.5, cache.cost
+`;
+  runPython(script, process.env);
+});
+
 test("main cost matches Pi by including usage reported by subagent tools", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-hud-pi-cost-"));
   writeFileSync(
@@ -1272,7 +1291,7 @@ test("HUD startup is idempotent and restart-safe across terminals", () => {
   assert.match(extensionSource, /PI_HUD_DIR/);
   assert.match(extensionSource, /pythonw/);
   assert.match(extensionSource, /hudProcess\.once\("error"/);
-  assert.match(extensionSource, /deactivate: \(\) => \{\}/);
+  assert.match(extensionSource, /process\.once\("exit"/);
   assert.doesNotMatch(extensionSource, /process\.on\("beforeExit"/);
   assert.doesNotMatch(extensionSource, /process\.kill\(oldPid,\s*["']SIGTERM["']\)/);
   assert.match(pythonSource, /HUD_DIR = os\.getenv\("PI_HUD_DIR"/);

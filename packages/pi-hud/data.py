@@ -562,7 +562,8 @@ class SessionCache:
                     entry = json.loads(line)
                     if not isinstance(entry, dict):
                         continue
-                    if entry.get("type") in ("compaction", "branch_summary"):
+                    # Pi 1.0 records non-message usage (e.g. cache warming) as "usage" entries.
+                    if entry.get("type") in ("compaction", "branch_summary", "usage"):
                         self._cost += _usage_cost(entry.get("usage"))
                         continue
                     message = entry.get("message", {})

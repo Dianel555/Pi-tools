@@ -1,6 +1,6 @@
 # pi-hooks-rules
 
-A Pi 0.84.3+ package for Node.js 22.19+ that provides:
+A Pi 0.84.3+ package (compatible with Pi 1.0) for Node.js 22.19+ that provides:
 
 - `/hooks` interactive management and command-line actions.
 - Global and trusted-project hook configuration.
@@ -90,7 +90,7 @@ Do not edit the installed `hooks.json`: package upgrades replace it. Put persona
 | Event | Runs | Failure behavior | Use it for |
 |-------|------|------------------|------------|
 | `tool_call` | Before the selected tool executes | A denial or non-zero exit blocks the tool call | Secret checks, destructive-operation guards, policy gates |
-| `tool_result` | After the selected tool returns | A non-zero exit marks the result as failed and adds the hook error to the result; it cannot undo the tool | Syntax checks, formatters, result validation, diagnostics |
+| `tool_result` | After the selected tool returns | A non-zero exit marks the result as failed and adds the hook error to the result; it cannot undo the tool. The tool's `structuredContent` is kept, so codemode scripts still receive the original structured result | Syntax checks, formatters, result validation, diagnostics |
 
 A `tool_call` payload has `tool_name` and `tool_input`. A `tool_result` payload also has `tool_response` and `tool_error`. Choose `tool_call` when prevention matters; choose `tool_result` when the tool must run before validation.
 
@@ -204,7 +204,7 @@ The package does not ship personal rules. Add Markdown files to either location:
 - Global: `~/.pi/agent/rules/`
 - Project: `.pi/rules/`
 
-Rules without front matter load for every turn. Path-scoped rules use a `paths` front-matter list and are added after Pi reads, writes, or edits a matching path relative to the working directory. They are not added for unrelated paths:
+Rules without front matter load at the start of each agent turn. On Pi 1.0 they are added as the `auto_loaded_rules` system prompt section, so the rest of Pi's structured prompt and other extensions' prompt changes stay intact; hosts without prompt sections receive them appended to the system prompt. If an extension that runs earlier replaces the whole system prompt (returns `systemPrompt`), the rules are appended to that replacement instead. An extension that replaces the whole prompt after this one runs overrides the rules for that turn; Pi provides no way to combine the two, so load such extensions before this package. Path-scoped rules are **not loaded at session startup**: they are added after Pi reads, writes, or edits a matching path. Matching checks the path relative to the working directory and its ancestors, so a rule such as `openspec/**` also works when Pi starts inside the `openspec/` directory. Shell commands do not trigger path-scoped injection; the path must be accessed through `read`, `write`, or `edit`. Unmatched paths do not inject a rule:
 
 ```md
 ---
@@ -214,7 +214,7 @@ paths:
 ---
 ```
 
-Project hooks and rules load only when the project also contains a Pi trust-triggering resource such as `.pi/settings.json`, `.pi/extensions/`, `.pi/skills/`, `.pi/prompts/`, `.pi/themes/`, `.pi/SYSTEM.md`, `.pi/APPEND_SYSTEM.md`, or project/ancestor `.agents/skills/`, and the project is trusted. This prevents a repository containing only hidden hook/rule files from bypassing Pi's trust prompt.
+Project hooks and rules load only when the project also contains a Pi trust-triggering resource and the project is trusted. The check uses Pi's own trust detection, so it follows the running Pi version; on Pi 1.0 the resources are `.pi/settings.json`, `.pi/mcp.json`, `.pi/extensions/`, `.pi/skills/`, `.pi/prompts/`, `.pi/themes/`, `.pi/SYSTEM.md`, `.pi/APPEND_SYSTEM.md`, or project/ancestor `.agents/skills/`. This prevents a repository containing only hidden hook/rule files from bypassing Pi's trust prompt.
 
 ## Security
 

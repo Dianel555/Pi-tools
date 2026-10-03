@@ -21,14 +21,14 @@ Always-on-top real-time task monitor for [Pi](https://github.com/earendil-works/
 pi install npm:@dianel/pi-hud
 ```
 
-After installation, restart Pi. The monitor window appears in the top-left corner.
+After installation, restart Pi. The monitor window appears in the top-left corner when a Pi session starts. Compatible with Pi 1.0 and its default fullscreen TUI.
 
 ## Features
 
 - **Multi-session aware** — switches between multiple Pi terminal sessions
 - **Multi-monitor safe** — validates the saved window position against the current virtual desktop and recenters it when a monitor is disconnected or the layout changes
 - **Provider-aware model display** — maps the model requested in the session to the matching model configured for that provider, with safe fallback to the runtime value
-- **Reload-safe** — `/settings reload` or Pi restart automatically refreshes the HUD
+- **Reload-safe** — `/reload` or a Pi restart reuses the running HUD instead of opening a second window
 - **OAuth indicator** — 🔒 shown when the current provider has valid login credentials
 - **Session navigation** — ◀ ▶ buttons or keyboard shortcuts to browse sessions
 - **Responsive layout** — footer switches between one and two rows; horizontal resizing preserves the current UI scale, while vertical resizing keeps status and command content centered
@@ -82,9 +82,11 @@ After installation, restart Pi. The monitor window appears in the top-left corne
 
 ## How It Works
 
-The ESM extension registers Pi lifecycle hooks. On start it registers the current terminal and starts `pi_hud.py` only when the shared monitor is not already alive. The Python side tails the latest Pi session JSONL file and reads settings / models for live status, rendering a compact Tkinter overlay. Multiple Pi terminals share this one monitor process through a PID registry; it exits only after the last registered terminal is gone.
+The ESM extension registers Pi lifecycle hooks. On `session_start` (startup, `/reload`, new, resume, or fork) it registers the current terminal and starts `pi_hud.py` only when the shared monitor is not already alive. The Python side tails the latest Pi session JSONL file and reads settings / models for live status, rendering a compact Tkinter overlay. Multiple Pi terminals share this one monitor process through a PID registry; it exits only after the last registered terminal is gone.
 
-On reload, the Node extension reuses the existing monitor and only removes its own terminal registration, so another terminal cannot make the shared panel disappear.
+Loading the extension alone starts nothing, so Pi commands that load extensions without a session never open the monitor. On reload, the Node extension reuses the existing monitor and keeps one process exit hook, which removes only this terminal's registration when Pi exits, so another terminal cannot make the shared panel disappear.
+
+Startup diagnostics are written to `~/.pi/pi-hud.log` (or `$PI_HUD_DIR/pi-hud.log`) instead of the terminal, so they cannot corrupt Pi's fullscreen display.
 
 ### Context calculation
 
@@ -133,7 +135,7 @@ Right-click the monitor and open **theme** to choose **Dark**, **White**, or **P
 | Provider / Model | Session JSONL provides the actual provider/model request; the displayed model is normalized against that provider's `models.json` / `models-store.json` catalog |
 | Thinking level | Session JSONL — `thinking_level_change` event |
 | Token usage | Session JSONL — assistant message usage |
-| Main / subagent cost | Main-session usage, all tool-result usage, and compaction/branch-summary usage; recognized subagent-tool cost is shown separately |
+| Main / subagent cost | Main-session usage, all tool-result usage, compaction/branch-summary usage, and Pi 1.0 `usage` entries such as cache warming; recognized subagent-tool cost is shown separately |
 | Activity status | Session JSONL — `agent_start` / `agent_settled` lifecycle events |
 | OAuth status | `~/.pi/agent/auth.json` — provider credential expiry |
 | Context window | `models.json` → `models-store.json` → `~/.pi/model_config.json` |

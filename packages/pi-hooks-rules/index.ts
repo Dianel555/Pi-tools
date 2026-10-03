@@ -8,12 +8,12 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   CONFIG_DIR_NAME,
   getAgentDir,
+  hasTrustRequiringProjectResources,
   parseFrontmatter,
   type ExtensionAPI,
   type ExtensionContext,
@@ -201,33 +201,9 @@ export function findMarkdownFiles(root: string): string[] {
   return files.sort();
 }
 
-const PROJECT_TRUST_MARKERS = [
-  "settings.json",
-  "extensions",
-  "skills",
-  "prompts",
-  "themes",
-  "SYSTEM.md",
-  "APPEND_SYSTEM.md",
-];
-
+// Reuse Pi's own trust gate so newly trust-gated resources (such as 1.0's mcp.json) stay in sync.
 export function hasProjectTrustMarker(cwd: string): boolean {
-  const configDir = join(cwd, CONFIG_DIR_NAME);
-  if (PROJECT_TRUST_MARKERS.some((entry) => existsSync(join(configDir, entry)))) return true;
-
-  const normalize = (path: string) => {
-    const resolved = resolve(path);
-    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
-  };
-  const userSkills = normalize(join(process.env.HOME || homedir(), ".agents", "skills"));
-  let current = resolve(cwd);
-  while (true) {
-    const skills = join(current, ".agents", "skills");
-    if (normalize(skills) !== userSkills && existsSync(skills)) return true;
-    const parent = dirname(current);
-    if (parent === current) return false;
-    current = parent;
-  }
+  return hasTrustRequiringProjectResources(cwd);
 }
 
 function parseRuleDocument(source: string): Omit<RuleDocument, "path"> {
@@ -501,13 +477,33 @@ export default function hooksAndRulesExtension(pi: ExtensionAPI) {
 
   function scopedRulesForTool(toolName: string, input: Record<string, unknown>, cwd: string): RuleDocument[] {
     if (!(["read", "write", "edit"] as string[]).includes(toolName) || typeof input.path !== "string") return [];
-    const target = normalizeRulePath(relative(cwd, resolve(cwd, input.path)));
-    if (!target || target.startsWith("../")) return [];
+    const absolute = resolve(cwd, input.path);
+    const relativeTarget = relative(cwd, absolute);
+    if (!relativeTarget || isAbsolute(relativeTarget)) return [];
+    const target = normalizeRulePath(relativeTarget);
+    if (target === ".." || target.startsWith("../")) return [];
+    // Scoped rules name project paths, but a session started below the project root only
+    // sees a working-directory-relative path. Test the target relative to each ancestor
+    // as well, so a rule scoped to the working directory's own prefix still matches (for
+    // example "**/openspec/**" while Pi runs inside the openspec directory).
+    const matchesTarget = (paths: string[]): boolean => {
+      if (matchesRulePath(target, paths)) return true;
+      for (let parent = dirname(cwd); ; parent = dirname(parent)) {
+        const relativeFromParent = relative(parent, absolute);
+        const fromParent = normalizeRulePath(relativeFromParent);
+        if (
+          !isAbsolute(relativeFromParent) &&
+          fromParent !== ".." &&
+          !fromParent.startsWith("../")
+        ) {
+          if (matchesRulePath(fromParent, paths)) return true;
+        }
+        if (parent === dirname(parent)) break;
+      }
+      return false;
+    };
     return rules.filter(
-      (rule) =>
-        rule.paths &&
-        !injectedScopedRules.has(rule.path) &&
-        matchesRulePath(target, rule.paths),
+      (rule) => rule.paths && !injectedScopedRules.has(rule.path) && matchesTarget(rule.paths),
     );
   }
 
@@ -799,6 +795,21 @@ export default function hooksAndRulesExtension(pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (event) => {
     const unscopedRules = rules.filter((rule) => !rule.paths);
+    // Pi >= 0.86 exposes mutable prompt sections. Returning systemPrompt there becomes
+    // forceSystemPrompt, which replaces the whole structured prompt for the run.
+    const options = event.systemPromptOptions as
+      | { sections?: Record<string, string>; forceSystemPrompt?: string }
+      | undefined;
+    const sections = options?.sections;
+    // An earlier handler that returned systemPrompt makes Pi ignore sections for this run,
+    // so append to the forced text instead. A later forcing handler still overrides this;
+    // Pi offers no way to compose with it.
+    if (sections && options?.forceSystemPrompt === undefined) {
+      if (unscopedRules.length === 0) delete sections.auto_loaded_rules;
+      else sections.auto_loaded_rules = `## Auto-loaded Rules\n\n${formatRules(unscopedRules)}`;
+      return;
+    }
+    if (sections) delete sections.auto_loaded_rules;
     if (unscopedRules.length === 0) return;
     return { systemPrompt: `${event.systemPrompt}\n\n## Auto-loaded Rules\n\n${formatRules(unscopedRules)}` };
   });
@@ -829,6 +840,8 @@ export default function hooksAndRulesExtension(pi: ExtensionAPI) {
       return {
         content: [...event.content, { type: "text" as const, text: `Hook configuration error: ${configError}` }],
         isError: true,
+        // Replacing content without structuredContent drops it in Pi >= 0.99.
+        structuredContent: event.structuredContent,
       };
     }
     const toolName = event.toolName.toLowerCase();
@@ -859,6 +872,7 @@ export default function hooksAndRulesExtension(pi: ExtensionAPI) {
         ...messages.map((text) => ({ type: "text" as const, text })),
       ],
       ...(messages.length ? { isError: true } : {}),
+      structuredContent: event.structuredContent,
     };
   });
 }
