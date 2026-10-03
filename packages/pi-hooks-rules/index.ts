@@ -19,14 +19,33 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
-export type HookEvent = "tool_call" | "tool_result";
+const TOOL_HOOK_EVENTS = ["tool_call", "tool_result"] as const;
+const LIFECYCLE_HOOK_EVENTS = [
+  "session_start",
+  "input",
+  "user_bash",
+  "before_agent_start",
+  "agent_before_settle",
+  "session_before_compact",
+  "session_shutdown",
+] as const;
+export type ToolHookEvent = (typeof TOOL_HOOK_EVENTS)[number];
+export type LifecycleHookEvent = (typeof LIFECYCLE_HOOK_EVENTS)[number];
+export type HookEvent = ToolHookEvent | LifecycleHookEvent;
+const HOOK_EVENTS: readonly HookEvent[] = [...TOOL_HOOK_EVENTS, ...LIFECYCLE_HOOK_EVENTS];
+
+function isToolEvent(event: HookEvent): event is ToolHookEvent {
+  return event === "tool_call" || event === "tool_result";
+}
+
 export type HookScope = "default" | "global" | "project";
 type HookStatus = "passed" | "blocked" | "failed" | "error";
 
 export type HookDefinition = {
   id: string;
   event: HookEvent;
-  tools: string[];
+  /** Tool selector; present only for tool_call and tool_result hooks. */
+  tools?: string[];
   command: string;
   args?: string[];
   timeoutMs?: number;
@@ -52,6 +71,7 @@ type HookResult = {
   hookSpecificOutput?: {
     permissionDecision?: string;
     permissionDecisionReason?: string;
+    additionalContext?: string;
   };
 };
 
@@ -59,7 +79,7 @@ type HookRun = {
   at: string;
   id: string;
   event: HookEvent;
-  tool: string;
+  tool?: string;
   status: HookStatus;
   code: number | null;
   durationMs: number;
@@ -83,6 +103,24 @@ const globalConfigPath = join(agentDir, "hooks-rules.json");
 const MAX_RECENT_RUNS = 100;
 const MAX_OUTPUT_CHARS = 8_000;
 const MAX_CAPTURE_CHARS = 64_000;
+const CONTEXT_MESSAGE_TYPE = "hooks-rules-context";
+const CONTINUE_MESSAGE_TYPE = "hooks-rules-continue";
+// Bounds how often agent_before_settle hooks can keep one run going, so a hook that always
+// denies cannot loop forever. Raise it only together with a per-hook opt-in.
+const MAX_SETTLE_CONTINUATIONS = 3;
+// Gates act on the first denial; fail-closed gates also stop at, and act on, the first failure.
+// Compaction is not fail-closed: a broken hook must not cancel overflow recovery.
+const GATE_EVENTS = new Set<HookEvent>(["input", "user_bash", "session_before_compact", "agent_before_settle"]);
+const FAIL_CLOSED_EVENTS = new Set<HookEvent>(["input", "user_bash", "agent_before_settle"]);
+const SAMPLE_LIFECYCLE_FIELDS: Record<LifecycleHookEvent, Record<string, unknown>> = {
+  session_start: { reason: "startup" },
+  input: { prompt: "pi hook test", source: "interactive" },
+  user_bash: { tool_name: "Bash", tool_input: { command: "printf pi-hook-test" }, exclude_from_context: false },
+  before_agent_start: { prompt: "pi hook test" },
+  agent_before_settle: { outcome: "completed", stop_hook_active: false },
+  session_before_compact: { reason: "manual", will_retry: false },
+  session_shutdown: { reason: "quit" },
+};
 
 export function validateHook(value: unknown, source: string): HookDefinition {
   if (!value || typeof value !== "object") throw new Error(`${source}: hook must be an object`);
@@ -90,11 +128,19 @@ export function validateHook(value: unknown, source: string): HookDefinition {
   if (!hook.id || !/^[a-z0-9][a-z0-9._-]*$/i.test(hook.id)) {
     throw new Error(`${source}: hook id must match [a-z0-9._-]+`);
   }
-  if (hook.event !== "tool_call" && hook.event !== "tool_result") {
-    throw new Error(`${source}/${hook.id}: event must be tool_call or tool_result`);
+  if (!HOOK_EVENTS.includes(hook.event as HookEvent)) {
+    throw new Error(`${source}/${hook.id}: event must be one of ${HOOK_EVENTS.join(", ")}`);
   }
-  if (!Array.isArray(hook.tools) || hook.tools.length === 0 || hook.tools.some((tool) => typeof tool !== "string")) {
-    throw new Error(`${source}/${hook.id}: tools must be a non-empty string array`);
+  const event = hook.event as HookEvent;
+  let tools: string[] | undefined;
+  if (isToolEvent(event)) {
+    if (!Array.isArray(hook.tools) || hook.tools.length === 0 || hook.tools.some((tool) => typeof tool !== "string")) {
+      throw new Error(`${source}/${hook.id}: tools must be a non-empty string array`);
+    }
+    tools = hook.tools.map((tool) => tool.toLowerCase());
+  } else if (hook.tools !== undefined && !(Array.isArray(hook.tools) && hook.tools.length === 0)) {
+    // An empty list is tolerated so files written by hand or by older tooling still load.
+    throw new Error(`${source}/${hook.id}: tools only applies to tool_call and tool_result events`);
   }
   if (!hook.command || typeof hook.command !== "string" || hook.command.includes("\n")) {
     throw new Error(`${source}/${hook.id}: command must be one executable without newlines`);
@@ -110,8 +156,8 @@ export function validateHook(value: unknown, source: string): HookDefinition {
   }
   return {
     id: hook.id,
-    event: hook.event,
-    tools: hook.tools.map((tool) => tool.toLowerCase()),
+    event,
+    ...(tools ? { tools } : {}),
     command: hook.command,
     args: hook.args ?? [],
     timeoutMs: hook.timeoutMs ?? 5_000,
@@ -315,12 +361,41 @@ export function parseHookResult(stdout: string): HookResult | undefined {
   return undefined;
 }
 
+type HookDecision = { denied: false } | { denied: true; reason: string | undefined };
+
+function nonEmptyText(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function readDecision(result: HookResult | undefined): HookDecision {
+  const specific = result?.hookSpecificOutput;
+  if (specific?.permissionDecision === "deny") return { denied: true, reason: nonEmptyText(specific.permissionDecisionReason) };
+  if (result?.decision === "block" || result?.decision === "deny") return { denied: true, reason: nonEmptyText(result.reason) };
+  return { denied: false };
+}
+
 export function denialReason(result: HookResult | undefined): string | undefined {
-  if (result?.hookSpecificOutput?.permissionDecision === "deny") {
-    return result.hookSpecificOutput.permissionDecisionReason ?? "Blocked by hook";
-  }
-  if (result?.decision === "block" || result?.decision === "deny") return result.reason ?? "Blocked by hook";
-  return undefined;
+  const decision = readDecision(result);
+  // Decide on the decision itself; an empty reason must not turn a denial into an allow.
+  return decision.denied ? (decision.reason ?? "Blocked by hook") : undefined;
+}
+
+function additionalContext(result: HookResult | undefined): string | undefined {
+  return nonEmptyText(result?.hookSpecificOutput?.additionalContext);
+}
+
+function hookFailure(hook: LoadedHook, result: { code: number | null; stdout: string; stderr: string }): string {
+  return `Hook ${hook.id} failed${result.code === null ? "" : ` with exit ${result.code}`}: ${truncate(result.stderr || result.stdout)}`;
+}
+
+function lifecyclePayload(event: LifecycleHookEvent, ctx: ExtensionContext, fields: Record<string, unknown>) {
+  return {
+    hook_event_name: event,
+    cwd: ctx.cwd,
+    session_id: ctx.sessionManager?.getSessionId(),
+    transcript_path: ctx.sessionManager?.getSessionFile(),
+    ...fields,
+  };
 }
 
 function truncate(text: string): string {
@@ -389,12 +464,11 @@ function runProcess(
   });
 }
 
-export function matchesHook(hook: LoadedHook, event: HookEvent, toolName: string): boolean {
-  return (
-    hook.enabled !== false &&
-    hook.event === event &&
-    (hook.tools.includes("*") || hook.tools.includes(toolName.toLowerCase()))
-  );
+export function matchesHook(hook: LoadedHook, event: HookEvent, toolName?: string): boolean {
+  if (hook.enabled === false || hook.event !== event) return false;
+  if (!isToolEvent(event)) return true;
+  const tools = hook.tools ?? [];
+  return toolName !== undefined && (tools.includes("*") || tools.includes(toolName.toLowerCase()));
 }
 
 function formatHook(hook: LoadedHook): string {
@@ -402,7 +476,7 @@ function formatHook(hook: LoadedHook): string {
     `${hook.enabled === false ? "○" : "●"} ${hook.id}`,
     `scope: ${hook.scope}`,
     `event: ${hook.event}`,
-    `tools: ${hook.tools.join(", ")}`,
+    ...(hook.tools ? [`tools: ${hook.tools.join(", ")}`] : []),
     `command: ${hook.command} ${(hook.args ?? []).join(" ")}`.trim(),
     `timeout: ${hook.timeoutMs ?? 5_000}ms`,
     `config: ${hook.configPath}`,
@@ -416,6 +490,10 @@ export default function hooksAndRulesExtension(pi: ExtensionAPI) {
   const injectedScopedRules = new Set<string>();
   let configError: string | undefined;
   let rulesError: string | undefined;
+  // additionalContext from session_start hooks, injected once with the next agent run.
+  let pendingSessionContext: string[] = [];
+  // agent_before_settle continuations requested by this plugin since the last agent_settled.
+  let settleContinuations = 0;
 
   function projectConfigPath(ctx: ExtensionContext): string {
     return join(ctx.cwd, CONFIG_DIR_NAME, "hooks-rules.json");
@@ -518,7 +596,7 @@ export default function hooksAndRulesExtension(pi: ExtensionAPI) {
 
   async function executeHook(
     hook: LoadedHook,
-    tool: string,
+    tool: string | undefined,
     payload: unknown,
     cwd: string,
     signal?: AbortSignal,
@@ -595,10 +673,14 @@ export default function hooksAndRulesExtension(pi: ExtensionAPI) {
     if (!scope) return;
     const id = (await ctx.ui.input("Hook id", "my-hook"))?.trim();
     if (!id) return;
-    const event = (await ctx.ui.select("Hook event", ["tool_call", "tool_result"])) as HookEvent | undefined;
+    const event = (await ctx.ui.select("Hook event", [...HOOK_EVENTS])) as HookEvent | undefined;
     if (!event) return;
-    const toolsInput = (await ctx.ui.input("Tools (comma-separated or *)", "bash,write"))?.trim();
-    if (!toolsInput) return;
+    let tools: string[] | undefined;
+    if (isToolEvent(event)) {
+      const toolsInput = (await ctx.ui.input("Tools (comma-separated or *)", "bash,write"))?.trim();
+      if (!toolsInput) return;
+      tools = toolsInput.split(",").map((tool) => tool.trim()).filter(Boolean);
+    }
     const command = (await ctx.ui.input("Executable", "${node}"))?.trim();
     if (!command) return;
     const argsText = await ctx.ui.editor(
@@ -611,7 +693,7 @@ export default function hooksAndRulesExtension(pi: ExtensionAPI) {
       {
         id,
         event,
-        tools: toolsInput.split(",").map((tool) => tool.trim()).filter(Boolean),
+        ...(tools ? { tools } : {}),
         command,
         args: argsText.split(/\r?\n/).filter((arg) => arg.length > 0),
         timeoutMs: Number(timeoutText),
@@ -655,7 +737,7 @@ export default function hooksAndRulesExtension(pi: ExtensionAPI) {
   function showList(ctx: ExtensionContext): void {
     const lines = hooks.map(
       (hook) =>
-        `${hook.enabled === false ? "○" : "●"} ${hook.id} [${hook.scope}] ${hook.event} → ${hook.tools.join(",")}`,
+        `${hook.enabled === false ? "○" : "●"} ${hook.id} [${hook.scope}] ${hook.event}${hook.tools ? ` → ${hook.tools.join(",")}` : ""}`,
     );
     ctx.ui.notify(
       [
@@ -678,7 +760,7 @@ export default function hooksAndRulesExtension(pi: ExtensionAPI) {
         ? selected
             .map(
               (run) =>
-                `${run.at} ${run.status.toUpperCase()} ${run.id} ${run.event}/${run.tool} code=${run.code ?? "-"} ${run.durationMs}ms`,
+                `${run.at} ${run.status.toUpperCase()} ${run.id} ${run.event}${run.tool ? `/${run.tool}` : ""} code=${run.code ?? "-"} ${run.durationMs}ms`,
             )
             .join("\n")
         : "No hook runs recorded in this session",
@@ -689,19 +771,28 @@ export default function hooksAndRulesExtension(pi: ExtensionAPI) {
   async function testHook(ctx: ExtensionContext, hook?: LoadedHook): Promise<void> {
     const selected = hook ?? (await pickHook(ctx, "Test hook"));
     if (!selected) return;
-    const tool = selected.tools.find((candidate) => candidate !== "*") ?? "bash";
-    const input: Record<string, unknown> =
-      tool === "write" || tool === "edit"
-        ? { path: join(extensionDir, ".pi-hook-test.txt"), content: "pi hook test" }
-        : { command: "printf pi-hook-test" };
-    const payload = hookEnvelope(tool, input, selected.event === "tool_result" ? { content: [], isError: false } : undefined);
+    let tool: string | undefined;
+    let payload: unknown;
+    if (isToolEvent(selected.event)) {
+      tool = selected.tools?.find((candidate) => candidate !== "*") ?? "bash";
+      const input: Record<string, unknown> =
+        tool === "write" || tool === "edit"
+          ? { path: join(extensionDir, ".pi-hook-test.txt"), content: "pi hook test" }
+          : { command: "printf pi-hook-test" };
+      payload = hookEnvelope(tool, input, selected.event === "tool_result" ? { content: [], isError: false } : undefined);
+    } else {
+      payload = lifecyclePayload(selected.event, ctx, SAMPLE_LIFECYCLE_FIELDS[selected.event]);
+    }
     const result = await executeHook(selected, tool, payload, ctx.cwd);
-    const denial = denialReason(parseHookResult(result.stdout));
+    const parsed = parseHookResult(result.stdout);
+    const denial = denialReason(parsed);
+    const context = additionalContext(parsed);
     if (denial) result.run.status = "blocked";
     ctx.ui.notify(
       [
         `${selected.id}: ${result.run.status} (code ${result.code ?? "-"}, ${result.run.durationMs}ms)`,
         denial ? `decision: ${denial}` : "",
+        context ? `additionalContext: ${truncate(context)}` : "",
         result.stdout ? `stdout: ${truncate(result.stdout)}` : "",
         result.stderr ? `stderr: ${truncate(result.stderr)}` : "",
       ]
@@ -787,13 +878,119 @@ export default function hooksAndRulesExtension(pi: ExtensionAPI) {
     },
   });
 
+  type LifecycleOutcome = {
+    /** First denial from a gate event; later hooks do not run. */
+    denial?: { hook: LoadedHook; reason: string | undefined };
+    /** First failure of a fail-closed event; later hooks do not run. */
+    failure?: string;
+    /** Failures that do not stop the event. */
+    failures: string[];
+    contexts: string[];
+  };
+
+  async function runLifecycleHooks(
+    event: LifecycleHookEvent,
+    ctx: ExtensionContext,
+    fields: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<LifecycleOutcome> {
+    const outcome: LifecycleOutcome = { failures: [], contexts: [] };
+    const matched = hooks.filter((hook) => matchesHook(hook, event));
+    if (matched.length === 0) return outcome;
+    const payload = lifecyclePayload(event, ctx, fields);
+    for (const hook of matched) {
+      const result = await executeHook(hook, undefined, payload, ctx.cwd, signal);
+      const parsed = parseHookResult(result.stdout);
+      const decision = readDecision(parsed);
+      // Like tool_call, an explicit denial takes precedence over the exit code.
+      if (decision.denied && GATE_EVENTS.has(event)) {
+        result.run.status = "blocked";
+        outcome.denial = { hook, reason: decision.reason };
+        return outcome;
+      }
+      if (result.code !== 0) {
+        result.run.status = "failed";
+        const message = hookFailure(hook, result);
+        if (FAIL_CLOSED_EVENTS.has(event)) {
+          outcome.failure = message;
+          return outcome;
+        }
+        outcome.failures.push(message);
+        continue;
+      }
+      const context = additionalContext(parsed);
+      if (context) outcome.contexts.push(context);
+    }
+    return outcome;
+  }
+
+  function blockReason(outcome: LifecycleOutcome): string | undefined {
+    if (outcome.denial) return outcome.denial.reason ?? `Blocked by hook ${outcome.denial.hook.id}`;
+    return outcome.failure;
+  }
+
+  function reportFailures(ctx: ExtensionContext, failures: string[]): void {
+    for (const failure of failures) ctx.ui.notify(failure, "warning");
+  }
+
   pi.on("session_start", async (event, ctx) => {
     injectedScopedRules.clear();
+    pendingSessionContext = [];
+    settleContinuations = 0;
     loadState(ctx, true);
     if (event.reason === "reload" && !configError && !rulesError) ctx.ui.notify("Reloaded hooks and rules.", "info");
+    // Runs after loadState because this plugin only knows its hooks once configuration is loaded.
+    const outcome = await runLifecycleHooks("session_start", ctx, {
+      reason: event.reason,
+      previous_session_file: event.previousSessionFile,
+    });
+    reportFailures(ctx, outcome.failures);
+    pendingSessionContext = outcome.contexts;
   });
 
-  pi.on("before_agent_start", async (event) => {
+  pi.on("input", async (event, ctx) => {
+    const outcome = await runLifecycleHooks("input", ctx, {
+      prompt: event.text,
+      source: event.source,
+      streaming_behavior: event.streamingBehavior,
+      image_count: event.images?.length ?? 0,
+    });
+    const blocked = blockReason(outcome);
+    if (!blocked) return;
+    ctx.ui.notify(`Prompt blocked: ${blocked}`, "warning");
+    return { action: "handled" as const };
+  });
+
+  pi.on("user_bash", async (event, ctx) => {
+    // Same shape as a Bash tool_call payload, so command guards can be reused for ! commands.
+    const outcome = await runLifecycleHooks("user_bash", ctx, {
+      tool_name: "Bash",
+      tool_input: { command: event.command },
+      exclude_from_context: event.excludeFromContext,
+    });
+    const blocked = blockReason(outcome);
+    if (!blocked) return;
+    return { result: { output: `Blocked by hook: ${blocked}`, exitCode: 1, cancelled: false, truncated: false } };
+  });
+
+  pi.on("before_agent_start", async (event, ctx) => {
+    const outcome = await runLifecycleHooks("before_agent_start", ctx, { prompt: event.prompt }, ctx.signal);
+    reportFailures(ctx, outcome.failures);
+    const contexts = [...pendingSessionContext, ...outcome.contexts];
+    pendingSessionContext = [];
+    const message = contexts.length
+      ? { customType: CONTEXT_MESSAGE_TYPE, content: contexts.join("\n\n"), display: false }
+      : undefined;
+    const systemPrompt = applyRules(event);
+    if (!message && systemPrompt === undefined) return;
+    return { ...(message ? { message } : {}), ...(systemPrompt !== undefined ? { systemPrompt } : {}) };
+  });
+
+  /** Adds unscoped rules to the prompt; returns a replacement prompt only when sections cannot be used. */
+  function applyRules(event: {
+    readonly systemPrompt: string;
+    systemPromptOptions?: unknown;
+  }): string | undefined {
     const unscopedRules = rules.filter((rule) => !rule.paths);
     // Pi >= 0.86 exposes mutable prompt sections. Returning systemPrompt there becomes
     // forceSystemPrompt, which replaces the whole structured prompt for the run.
@@ -807,12 +1004,12 @@ export default function hooksAndRulesExtension(pi: ExtensionAPI) {
     if (sections && options?.forceSystemPrompt === undefined) {
       if (unscopedRules.length === 0) delete sections.auto_loaded_rules;
       else sections.auto_loaded_rules = `## Auto-loaded Rules\n\n${formatRules(unscopedRules)}`;
-      return;
+      return undefined;
     }
     if (sections) delete sections.auto_loaded_rules;
-    if (unscopedRules.length === 0) return;
-    return { systemPrompt: `${event.systemPrompt}\n\n## Auto-loaded Rules\n\n${formatRules(unscopedRules)}` };
-  });
+    if (unscopedRules.length === 0) return undefined;
+    return `${event.systemPrompt}\n\n## Auto-loaded Rules\n\n${formatRules(unscopedRules)}`;
+  }
 
   pi.on("tool_call", async (event, ctx) => {
     if (configError) return { block: true, reason: `Hook configuration error: ${configError}` };
@@ -874,5 +1071,73 @@ export default function hooksAndRulesExtension(pi: ExtensionAPI) {
       ...(messages.length ? { isError: true } : {}),
       structuredContent: event.structuredContent,
     };
+  });
+
+  pi.on("agent_before_settle", async (event, ctx) => {
+    // Aborted or failed runs end as they are; continuing them would override the user's stop.
+    if (event.outcome !== "completed" || !hooks.some((hook) => matchesHook(hook, "agent_before_settle"))) return;
+    if (settleContinuations >= MAX_SETTLE_CONTINUATIONS) {
+      ctx.ui.notify(
+        `agent_before_settle hooks reached the continuation limit (${MAX_SETTLE_CONTINUATIONS}); letting the run finish.`,
+        "warning",
+      );
+      return;
+    }
+    const outcome = await runLifecycleHooks(
+      "agent_before_settle",
+      ctx,
+      { outcome: event.outcome, stop_hook_active: settleContinuations > 0 },
+      ctx.signal,
+    );
+    if (outcome.failure) {
+      ctx.ui.notify(`${outcome.failure}; not continuing the run.`, "warning");
+      return;
+    }
+    if (!outcome.denial) return;
+    const reason = outcome.denial.reason;
+    if (!reason) {
+      // The reason becomes the model's next instruction; continuing without one would only loop.
+      ctx.ui.notify(`Hook ${outcome.denial.hook.id} asked to continue without a reason; ignoring it.`, "warning");
+      return;
+    }
+    settleContinuations += 1;
+    return {
+      entries: [
+        ...event.entries,
+        { type: "custom_message" as const, customType: CONTINUE_MESSAGE_TYPE, content: reason, display: true },
+      ],
+      continue: true,
+    };
+  });
+
+  pi.on("agent_settled", async () => {
+    settleContinuations = 0;
+  });
+
+  pi.on("session_before_compact", async (event, ctx) => {
+    const outcome = await runLifecycleHooks(
+      "session_before_compact",
+      ctx,
+      { reason: event.reason, will_retry: event.willRetry, custom_instructions: event.customInstructions },
+      event.signal,
+    );
+    reportFailures(ctx, outcome.failures);
+    if (!outcome.denial) return;
+    const reason = outcome.denial.reason ?? "no reason given";
+    ctx.ui.notify(
+      `Compaction cancelled by hook ${outcome.denial.hook.id}: ${reason}${
+        event.reason === "overflow" ? " Context overflow recovery will not retry." : ""
+      }`,
+      "warning",
+    );
+    return { cancel: true };
+  });
+
+  pi.on("session_shutdown", async (event, ctx) => {
+    const outcome = await runLifecycleHooks("session_shutdown", ctx, {
+      reason: event.reason,
+      target_session_file: event.targetSessionFile,
+    });
+    reportFailures(ctx, outcome.failures);
   });
 }

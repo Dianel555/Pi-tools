@@ -5,6 +5,7 @@ A Pi 0.84.3+ package (compatible with Pi 1.0) for Node.js 22.19+ that provides:
 - `/hooks` interactive management and command-line actions.
 - Global and trusted-project hook configuration.
 - Node-based pre-tool blocking and post-tool validation hooks.
+- Lifecycle hooks for session start/shutdown, prompt input, user `!` commands, agent start, final settlement, and compaction.
 - Per-session hook status, tests, and recent-run inspection.
 - Automatic injection of user and trusted-project Markdown rules.
 
@@ -38,7 +39,7 @@ The `/hooks` interface:
 
 ## Hook configuration
 
-Hooks are configured as JSON and run around Pi tool calls. The package ships Node-only defaults in [`hooks.json`](./hooks.json).
+Hooks are configured as JSON and run around Pi tool calls and lifecycle events. The package ships Node-only defaults in [`hooks.json`](./hooks.json).
 
 ### Configuration files
 
@@ -78,8 +79,8 @@ Do not edit the installed `hooks.json`: package upgrades replace it. Put persona
 | `hooks` | yes | Array of hook definitions. IDs must be unique within one file. |
 | `overrides` | no | Object of `{ "hook-id": { "enabled": boolean } }`; defaults to `{}`. |
 | `id` | yes | Non-empty; matches `[a-z0-9._-]+` (case-insensitive). |
-| `event` | yes | Exactly `tool_call` or `tool_result`. |
-| `tools` | yes | Non-empty string array; matching is case-insensitive. Use `"*"` for every tool. |
+| `event` | yes | A tool event from [Selecting an event](#selecting-an-event) or a lifecycle event from [Lifecycle events](#lifecycle-events). |
+| `tools` | tool events only | Required for `tool_call` and `tool_result`: non-empty string array; matching is case-insensitive. Use `"*"` for every tool. Omit it for lifecycle events. |
 | `command` | yes | One executable name or path, without newlines. |
 | `args` | no | String array; each item is passed as one argument. Defaults to `[]`. |
 | `timeoutMs` | no | Integer from `100` to `120000`; defaults to `5000`. |
@@ -93,6 +94,168 @@ Do not edit the installed `hooks.json`: package upgrades replace it. Put persona
 | `tool_result` | After the selected tool returns | A non-zero exit marks the result as failed and adds the hook error to the result; it cannot undo the tool. The tool's `structuredContent` is kept, so codemode scripts still receive the original structured result | Syntax checks, formatters, result validation, diagnostics |
 
 A `tool_call` payload has `tool_name` and `tool_input`. A `tool_result` payload also has `tool_response` and `tool_error`. Choose `tool_call` when prevention matters; choose `tool_result` when the tool must run before validation.
+
+### Lifecycle events
+
+Lifecycle hooks run for every occurrence of their event; they have no `tools` selector. Their payload always contains `hook_event_name`, `cwd`, `session_id`, and `transcript_path`, plus the fields below. A "denial" is the same decision JSON used by `tool_call` hooks.
+
+| Event | Extra payload fields | Denial | Non-zero exit | Use it for |
+|-------|----------------------|--------|---------------|------------|
+| `session_start` | `reason` (`startup`, `reload`, `new`, `resume`, `fork`), `previous_session_file` | Ignored | Warning | Environment checks, session context |
+| `input` | `prompt`, `source`, `streaming_behavior`, `image_count` | Drops the prompt and shows the reason | Drops the prompt | Prompt policy |
+| `user_bash` | `tool_name: "Bash"`, `tool_input.command`, `exclude_from_context` | Blocks the `!`/`!!` command and records the reason as its output | Blocks the command | Reusing command guards for user shell commands |
+| `before_agent_start` | `prompt` | Ignored | Warning | Per-run context |
+| `agent_before_settle` | `outcome`, `stop_hook_active` | Continues the run with the reason as the next instruction | Warning; the run finishes | Stop checks such as "tests still fail" |
+| `session_before_compact` | `reason` (`manual`, `threshold`, `overflow`), `will_retry`, `custom_instructions` | Cancels compaction | Warning; compaction continues | Preserving full history |
+| `session_shutdown` | `reason` (`quit`, `reload`, `new`, `resume`, `fork`), `target_session_file` | Ignored | Warning | Cleanup, notifications |
+
+- **Context injection.** A successful `session_start` or `before_agent_start` hook can print `{ "hookSpecificOutput": { "additionalContext": "..." } }`. The text is added to the next run as a hidden context message: `session_start` context once, `before_agent_start` context on every run.
+- **Settle continuations.** `agent_before_settle` hooks run only for runs that completed normally, never for aborted or failed ones. A denial must include a non-empty reason; it is shown in the transcript and sent to the model. One run can be continued at most 3 times; `stop_hook_active` is `true` after the first continuation so a hook can avoid repeating itself.
+- **Compaction.** Cancelling an `overflow` compaction also stops the overflow retry. A failing compaction hook never cancels compaction.
+- **Shutdown.** `session_shutdown` hooks run while Pi is exiting or replacing the session; keep them short.
+
+### Lifecycle examples
+
+The configuration below goes in `~/.pi/agent/hooks-rules.json` or a trusted project's `.pi/hooks-rules.json`; the scripts go in a `hooks/` directory next to it. Use only the entries you need.
+
+```json
+{
+  "version": 1,
+  "hooks": [
+    {
+      "id": "user-bash-destructive-guard",
+      "event": "user_bash",
+      "command": "${node}",
+      "args": ["${hooksDir}/destructive-command-guard.mjs"]
+    },
+    {
+      "id": "user-bash-secret-guard",
+      "event": "user_bash",
+      "command": "${node}",
+      "args": ["${hooksDir}/secret-guard.mjs"]
+    },
+    {
+      "id": "git-branch-context",
+      "event": "session_start",
+      "command": "${node}",
+      "args": ["${configDir}/hooks/git-branch-context.mjs"]
+    },
+    {
+      "id": "prompt-private-key-guard",
+      "event": "input",
+      "command": "${node}",
+      "args": ["${configDir}/hooks/prompt-private-key-guard.mjs"]
+    },
+    {
+      "id": "tests-before-finish",
+      "event": "agent_before_settle",
+      "command": "${node}",
+      "args": ["${configDir}/hooks/tests-before-finish.mjs"],
+      "timeoutMs": 120000
+    },
+    {
+      "id": "manual-compaction-only",
+      "event": "session_before_compact",
+      "command": "${node}",
+      "args": ["${configDir}/hooks/manual-compaction-only.mjs"]
+    },
+    {
+      "id": "session-log",
+      "event": "session_shutdown",
+      "command": "${node}",
+      "args": ["${configDir}/hooks/session-log.mjs", "${configDir}/session-log.txt"],
+      "timeoutMs": 1000
+    }
+  ]
+}
+```
+
+`user_bash` payloads use the Bash `tool_call` shape, so the bundled guards also check `!` and `!!` commands without changes.
+
+`hooks/git-branch-context.mjs` adds the current branch to the first run of each session. The same output works for `before_agent_start`, which adds it to every run:
+
+```js
+import { execFileSync } from "node:child_process";
+
+let raw = "";
+for await (const chunk of process.stdin) raw += chunk;
+const { cwd } = JSON.parse(raw);
+
+let branch;
+try {
+  branch = execFileSync("git", ["branch", "--show-current"], {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
+} catch {
+  process.exit(0); // Not a Git repository: add no context.
+}
+process.stdout.write(JSON.stringify({
+  hookSpecificOutput: { additionalContext: `Current Git branch: ${branch || "(detached HEAD)"}` },
+}));
+```
+
+`hooks/prompt-private-key-guard.mjs` drops a prompt that contains a private key:
+
+```js
+let raw = "";
+for await (const chunk of process.stdin) raw += chunk;
+const { prompt } = JSON.parse(raw);
+
+if (/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(prompt)) {
+  process.stdout.write(JSON.stringify({
+    decision: "block",
+    reason: "The prompt contains a private key. Remove it and refer to the key file path instead.",
+  }));
+}
+```
+
+`hooks/tests-before-finish.mjs` keeps the agent working while `npm test` fails. Its reason, including the end of the test output, becomes the model's next instruction; the plugin stops after 3 continuations. A hook that times out is reported as a failure and lets the run finish:
+
+```js
+import { spawnSync } from "node:child_process";
+
+let raw = "";
+for await (const chunk of process.stdin) raw += chunk;
+const { cwd } = JSON.parse(raw);
+
+const result = spawnSync("npm test", { cwd, shell: true, encoding: "utf8" });
+if (result.status !== 0) {
+  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim().slice(-2000);
+  process.stdout.write(JSON.stringify({
+    decision: "block",
+    reason: `npm test failed. Fix the failures before finishing.\n${output}`,
+  }));
+}
+```
+
+`hooks/manual-compaction-only.mjs` cancels automatic threshold compaction but allows `/compact` and overflow recovery:
+
+```js
+let raw = "";
+for await (const chunk of process.stdin) raw += chunk;
+const { reason } = JSON.parse(raw);
+
+if (reason === "threshold") {
+  process.stdout.write(JSON.stringify({
+    decision: "block",
+    reason: "Automatic compaction is disabled; run /compact when needed.",
+  }));
+}
+```
+
+`hooks/session-log.mjs` appends one line per session end to the file passed as its first argument:
+
+```js
+import { appendFileSync } from "node:fs";
+
+let raw = "";
+for await (const chunk of process.stdin) raw += chunk;
+const { reason, session_id } = JSON.parse(raw);
+
+appendFileSync(process.argv[2], `${new Date().toISOString()} ${reason} ${session_id ?? "-"}\n`);
+```
 
 ### Selecting tools
 
@@ -160,7 +323,7 @@ A hook should write diagnostics to stderr and, when returning a decision, write 
 }
 ```
 
-The plugin also accepts the legacy `{ "decision": "block", "reason": "..." }` shape. A valid denial blocks even with exit code `0`; any non-zero exit blocks `tool_call` hooks. A `tool_result` hook with a non-zero exit adds an error message to the returned result. Hook output is allowed to contain diagnostic lines before its final JSON result.
+The plugin also accepts the legacy `{ "decision": "block", "reason": "..." }` shape. A valid denial blocks even with exit code `0` or an empty reason; any non-zero exit blocks `tool_call` hooks. A `tool_result` hook with a non-zero exit adds an error message to the returned result. Hook output is allowed to contain diagnostic lines before its final JSON result.
 
 ### Built-in hooks
 

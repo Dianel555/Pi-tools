@@ -40,6 +40,27 @@ test("validates and normalizes hook definitions", () => {
   assert.throws(() => validateHook({ id: "bad id" }, "test"), /hook id/);
 });
 
+test("lifecycle hooks omit tools and reject tool selectors", () => {
+  const lifecycle = { id: "stop", event: "agent_before_settle", command: "node" };
+  const validated = validateHook(lifecycle, "test");
+  assert.equal("tools" in validated, false);
+  // An empty list is accepted so hand-written or older files still round-trip.
+  assert.deepEqual(validateHook({ ...lifecycle, tools: [] }, "test"), validated);
+  assert.deepEqual(validateHook(JSON.parse(JSON.stringify(validated)), "test"), validated);
+  assert.throws(() => validateHook({ ...lifecycle, tools: ["bash"] }, "test"), /tools only applies/);
+  assert.throws(() => validateHook({ ...lifecycle, event: "turn_end" }, "test"), /event must be one of/);
+  assert.throws(() => validateHook({ ...lifecycle, event: "tool_call" }, "test"), /tools must be a non-empty/);
+
+  const root = mkdtempSync(join(tmpdir(), "pi-hooks-lifecycle-"));
+  try {
+    const path = join(root, "hooks-rules.json");
+    writeFileSync(path, JSON.stringify({ version: 1, hooks: [lifecycle] }));
+    assert.deepEqual(readHookFile(path).hooks, [validated]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("parses hook decisions after diagnostic output", () => {
   const result = parseHookResult('diagnostic\n{"decision":"block","reason":"no"}');
   assert.equal(denialReason(result), "no");
@@ -52,6 +73,10 @@ test("parses hook decisions after diagnostic output", () => {
     }),
     "secret",
   );
+  // A denial without a usable reason must still deny.
+  assert.equal(denialReason({ decision: "deny", reason: "" }), "Blocked by hook");
+  assert.equal(denialReason({ hookSpecificOutput: { permissionDecision: "deny" } }), "Blocked by hook");
+  assert.equal(denialReason({ decision: "approve", reason: "fine" }), undefined);
 });
 
 test("matches enabled hooks by event and tool", () => {
@@ -69,6 +94,11 @@ test("matches enabled hooks by event and tool", () => {
   assert.equal(matchesHook(hook, "tool_call", "BASH"), true);
   assert.equal(matchesHook(hook, "tool_result", "bash"), false);
   assert.equal(matchesHook({ ...hook, enabled: false }, "tool_call", "bash"), false);
+  const { tools: _tools, ...withoutTools } = hook;
+  const lifecycle = { ...withoutTools, event: "input" as const };
+  assert.equal(matchesHook(lifecycle, "input"), true);
+  assert.equal(matchesHook(lifecycle, "user_bash"), false);
+  assert.equal(matchesHook({ ...lifecycle, enabled: false }, "input"), false);
 });
 
 test("counts always-on and injected path-scoped rules", () => {
@@ -180,5 +210,16 @@ test("reads optional configuration and registers Pi surfaces", () => {
   } as never);
 
   assert.equal(commands.has("hooks"), true);
-  assert.deepEqual(events, ["session_start", "before_agent_start", "tool_call", "tool_result"]);
+  assert.deepEqual(events, [
+    "session_start",
+    "input",
+    "user_bash",
+    "before_agent_start",
+    "tool_call",
+    "tool_result",
+    "agent_before_settle",
+    "agent_settled",
+    "session_before_compact",
+    "session_shutdown",
+  ]);
 });
