@@ -14,6 +14,7 @@ const dataSource = readFileSync(join(packageDir, "data.py"), "utf8");
 const themeSource = readFileSync(join(packageDir, "theme.py"), "utf8");
 const viewSource = readFileSync(join(packageDir, "view.py"), "utf8");
 const readmeSource = readFileSync(join(packageDir, "README.md"), "utf8");
+const readmeZhSource = readFileSync(join(packageDir, "README-zh.md"), "utf8");
 
 function runPython(code: string, env: NodeJS.ProcessEnv) {
   const result = spawnSync(process.env.PYTHON || "python", ["-c", code], {
@@ -1141,8 +1142,13 @@ test("bell state, subagent cost footer, and visible name have regression guards"
   assert.doesNotMatch(viewSource, /60s/);
   assert.match(viewSource, /_fmt_money\(cost\).*_fmt_money\(subagents_cost\)/s);
   assert.match(viewSource, /Pi.*subagents/);
-  assert.match(pythonSource, /● Pi Task Monitor/);
+  assert.match(pythonSource, /● \{self\._t\('title'\)\}/);
   assert.match(readmeSource, /# Pi Task Monitor/);
+  assert.match(readmeZhSource, /# Pi 任务监控/);
+  assert.match(pythonSource, /def _set_language\(self, language\):/);
+  assert.match(pythonSource, /language_menu = tk\.Menu/);
+  assert.match(pythonSource, /"language": self\.__dict__\.get\("_language", "zh"\)/);
+  assert.match(viewSource, /from i18n import translate/);
 
   const script = `
 import sys
@@ -1680,4 +1686,89 @@ assert geometries == ["680x100+10+20"]
   assert.doesNotMatch(pythonSource, /self\.lbl_cmd\.configure\(wraplength=/);
   assert.match(viewSource, /"🧠 ", "brain"/);
   assert.match(viewSource, /" 🔒", "lock"/);
+});
+
+test("circular HUD docks halfway and restores its rectangular geometry", () => {
+  const script = `
+import sys
+sys.path.insert(0, ${JSON.stringify(packageDir)})
+from orb import dock_edge, docked_geometry, logo_polygons, mix_color, popup_geometry, render_orb, summary_segments
+import pi_hud
+
+screen = (0, 0, 1920, 1080)
+assert dock_edge(4, 300, 100, 100, [screen]) == ("left", screen)
+assert dock_edge(12, 300, 100, 100, [screen]) is None
+x, y, width, height = docked_geometry("left", screen, anchor=(12, 240))
+assert (x, y, width, height) == (-25, 240, 50, 50)
+assert docked_geometry("left", screen, revealed=True, anchor=(12, 240))[:2] == (0, 240)
+assert docked_geometry("right", screen, anchor=(1800, 300))[0] == 1895
+assert docked_geometry("top", screen, anchor=(400, 8))[1] == -25
+assert docked_geometry("bottom", screen, anchor=(400, 1000))[1] == 1055
+
+logo = logo_polygons((0, 0, 800, 800))
+assert [color for color, _points in logo] == ["#F09082", "#4D9ABF", "#F1BE58"]
+assert mix_color("#000000", "#ffffff", 0.5) == "#808080"
+segments = summary_segments({
+    "provider": "openai", "auth_ok": True, "model": "gpt", "thinking": "high",
+    "agent_active": True, "tool": "edit", "command": "file.py",
+    "tokens": {"in": 1500, "out": 20, "ctx_pct": 150, "hit_rate": -5, "cost": 0.1, "subagents_cost": 0},
+    "language": "en",
+})
+text = "".join(value for value, _tag in segments)
+assert "openai 🔒" in text and "Context 100.0%" in text and "Cache 0.0%" in text
+assert "file.py" not in text
+image = render_orb("#1a1b26", "#7dcfff", 25, 50, {}, 120, 0.5)
+assert image.size == (120, 120)
+assert image.mode == "RGBA"
+assert image.getpixel((0, 0))[3] == 0
+assert image.getpixel((60, 60))[3] == 255
+popup = popup_geometry("left", (-50, 240, 100, 100), 240, 100, screen)
+assert popup[0] > 0 and popup[1] > 0
+
+import json, tempfile
+with tempfile.TemporaryDirectory() as temp:
+    pi_hud.CFG_FILE = temp + "/geometry.json"
+    class Hud:
+        def __init__(self):
+            self._shape = "orb"
+            self._dock_edge = "left"
+            self._orb_revealed = True
+            self._orb_motion_enabled = False
+            self._language = "en"
+            self._rect_geometry = "680x100+-20+-30"
+            self._theme_name = "dark"
+        def geometry(self):
+            return "100x100+0+0"
+    pi_hud.HUD._save_geom(Hud())
+    with open(pi_hud.CFG_FILE, encoding="utf-8") as handle:
+        saved = json.load(handle)
+    assert saved["g"] == "680x100+-20+-30"
+    assert saved["shape"] == "orb" and saved["dock"] == "left" and saved["revealed"] is True
+    assert saved["orb_motion"] is False
+    assert saved["language"] == "en"
+    loaded = pi_hud.HUD.__new__(pi_hud.HUD)
+    loaded._shape = "rect"
+    loaded._language = "zh"
+    loaded._dock_edge = None
+    loaded._orb_revealed = False
+    loaded.calls = []
+    loaded.geometry = lambda value=None: loaded.calls.append(value) or loaded.calls[-1]
+    pi_hud._screen_rectangles = lambda _window: [screen]
+    pi_hud.HUD._load_geom(loaded)
+    assert loaded._shape == "orb" and loaded._dock_edge == "left" and loaded._orb_revealed is True
+    assert loaded._orb_motion_enabled is False
+    assert loaded._language == "en"
+    assert loaded.calls[-1].startswith("680x100+")
+`;
+  runPython(script, process.env);
+  assert.match(pythonSource, /translate\(self\.__dict__\.get\("_language"/);
+  assert.match(pythonSource, /def _toggle_orb_reveal\(self\):/);
+  assert.match(pythonSource, /def _show_summary\(self\):/);
+});
+
+test("orb material, motion, and Tk lifecycle regression suite", () => {
+  runPython(`
+import runpy
+runpy.run_path(${JSON.stringify(join(here, "orb_ui_test.py"))}, run_name="__main__")
+`, process.env);
 });

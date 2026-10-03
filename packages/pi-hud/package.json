@@ -1,6 +1,6 @@
 {
   "name": "@dianel/pi-hud",
-  "version": "1.0.6",
+  "version": "1.1.0",
   "description": "Pi Task Monitor — always-on-top real-time task panel",
   "author": "Dianel555",
   "license": "MIT",
@@ -31,8 +31,13 @@
     "data.py",
     "theme.py",
     "view.py",
+    "i18n.py",
+    "orb.py",
+    "layered.py",
     "assets/*.png",
+    "assets/orb-motion.gif",
     "README.md",
+    "README-zh.md",
     "LICENSE"
   ],
   "pi": {

@@ -16,6 +16,8 @@ from contextlib import suppress
 from datetime import datetime, timezone
 
 from data import Collector, SessionCache
+from i18n import LANGUAGES, LANGUAGE_NAMES, translate
+from orb import OrbMotion, dock_edge, docked_geometry, physical_size
 from theme import C, THEMES
 
 # ── Windows API: 检查进程存活 ──
@@ -249,6 +251,7 @@ class HUD(tk.Tk):
         self._sessions = []
         self._session_idx = 0
         self._auto_follow = True
+        self._language = self._load_language()
         self._theme_name = self._load_theme_name()
         C.update(THEMES[self._theme_name])
         self.configure(bg=C["bg"], bd=0, highlightthickness=0)
@@ -266,9 +269,30 @@ class HUD(tk.Tk):
         self._geometry_idle = None
         self._footer_idle = None
         self._restore_borderless = False
+        self._shape = "rect"
+        self._rect_geometry = None
+        self._dock_edge = None
+        self._orb_revealed = False
+        self._orb_size = physical_size(self)
+        self._orb_motion = OrbMotion()
+        self._orb_motion_enabled = True
+        self._orb_hovered = False
+        self._orb_after = None
+        self._orb_canvas = None
+        self._orb_layer = None
+        self._orb_rendered = None
+        self._latest = {}
+        self._summary = None
+        self._summary_after = None
+        self._summary_fade_after = None
+        self._summary_layer = None
+        self._pointer_inside = False
         self._build()
         self._apply_theme()
         self._load_geom()
+        self._apply_language()
+        if self.__dict__.get("_shape") == "orb":
+            self._enter_orb(save=False)
         self._update_scale(self.winfo_width(), self.winfo_height())
         self._apply_fonts()
         self._set_min_size()
@@ -285,6 +309,8 @@ class HUD(tk.Tk):
         self.bind_all("<ButtonPress-1>", self._on_press, add="+")
         self.bind_all("<B1-Motion>", self._on_drag, add="+")
         self.bind_all("<ButtonRelease-1>", self._on_release, add="+")
+        self.bind_all("<Button-3>", self._menu, add="+")
+        self.bind_all("<Leave>", self._on_pointer_leave, add="+")
 
     def _build(self):
         # ── Titlebar ──
@@ -309,7 +335,7 @@ class HUD(tk.Tk):
         self.btn_next.bind("<Enter>", lambda e: self.btn_next.config(fg=C["accent"]))
         self.btn_next.bind("<Leave>", lambda e: self.btn_next.config(fg=C["sub"]))
 
-        self.lbl_title = tk.Label(tb, text="● Pi Task Monitor", bg=C["title"], fg=C["accent"])
+        self.lbl_title = tk.Label(tb, text=f"● {self._t('title')}", bg=C["title"], fg=C["accent"])
         self.lbl_title.pack(side="left", padx=10)
 
         self.lbl_session = tk.Label(
@@ -374,7 +400,7 @@ class HUD(tk.Tk):
         status_group.pack(expand=True)
         self.lbl_bell = tk.Label(status_group, text="🔔", bg=C["bg"], fg=C["dim"])
         self.lbl_bell.pack(side="left", padx=(0, 8))
-        self.lbl_status = tk.Label(status_group, text="OFFLINE", bg=C["bg"], fg=C["dim"])
+        self.lbl_status = tk.Label(status_group, text=self._t("offline"), bg=C["bg"], fg=C["dim"])
         self.lbl_status.pack(side="left")
         self.lbl_time = tk.Label(status_group, text="", bg=C["bg"], fg=C["dim"])
         self.lbl_time.pack(side="left", padx=(12, 0))
@@ -382,7 +408,7 @@ class HUD(tk.Tk):
         # Command line - centered vertically in body
         self.lbl_cmd = tk.Label(
             body,
-            text="(idle)",
+            text=self._t("idle_command"),
             bg=C["bg"],
             fg=C["text"],
             anchor="center",
@@ -432,8 +458,6 @@ class HUD(tk.Tk):
         ):
             widget.bindtags((str(widget), str(self), "all", widget.winfo_class()))
         # 绑定右键菜单、快捷键
-        for w in (self, body, ft, tb):
-            w.bind("<Button-3>", self._menu)
         self.bind_all("<Control-t>", lambda e: self._toggle_topmost())
         self.bind_all("<Control-a>", lambda e: self._toggle_alpha())
         self.bind_all("<Control-h>", lambda e: self._toggle_hide())
@@ -450,6 +474,16 @@ class HUD(tk.Tk):
             pass
 
     def _on_motion(self, evt):
+        if self.__dict__.get("_shape") == "orb":
+            if evt.widget not in (self, self._orb_canvas):
+                return
+            self._pointer_inside = True
+            if not self._orb_hovered:
+                self._orb_hovered = True
+                self._request_orb_frame()
+            self._set_cursor(evt.widget, "fleur")
+            self._schedule_summary()
+            return
         if self._drag:
             mode = self._drag["mode"]
             cursor = {
@@ -498,6 +532,20 @@ class HUD(tk.Tk):
         self._set_cursor(evt.widget, "")
 
     def _on_press(self, evt):
+        if self.__dict__.get("_shape") == "orb":
+            if evt.widget not in (self, self._orb_canvas):
+                return
+            self._hide_summary(force=True)
+            self._request_orb_frame()
+            self._drag = {
+                "mode": "move",
+                "x": evt.x_root,
+                "y": evt.y_root,
+                "wx": self.winfo_x(),
+                "wy": self.winfo_y(),
+                "moved": False,
+            }
+            return
         x = evt.x_root - self.winfo_x()
         y = evt.y_root - self.winfo_y()
         w, h = self.winfo_width(), self.winfo_height()
@@ -536,6 +584,9 @@ class HUD(tk.Tk):
         d = self._drag
         dx, dy = evt.x_root - d["x"], evt.y_root - d["y"]
         if d["mode"] == "move":
+            if self.__dict__.get("_shape") == "orb" and (abs(dx) > 3 or abs(dy) > 3):
+                d["moved"] = True
+                self._hide_summary(force=True)
             # pi-lens-ignore: unchecked-throwing-call-python
             self.geometry(f"+{int(d['wx'] + dx)}+{int(d['wy'] + dy)}")
             return
@@ -578,6 +629,7 @@ class HUD(tk.Tk):
             self.after_cancel(self._footer_idle)
             self._footer_idle = None
         if was_move:
+            moved = bool(self._drag.get("moved"))
             # Keep Configure events in the drag-suppressed path and discard any
             # stale resize queued before the move began.
             self._pending_geometry = None
@@ -592,8 +644,18 @@ class HUD(tk.Tk):
                 self._footer_idle = None
             self._pending_geometry = None
             self._drag = None
-            self.attributes("-alpha", self._alpha)
-            self._ensure_on_screen()
+            if self.__dict__.get("_shape") != "orb":
+                self.attributes("-alpha", self._alpha)
+            if self.__dict__.get("_shape") == "orb":
+                self._request_orb_frame()
+                if moved:
+                    self._pointer_inside = False
+                    self._hide_summary(force=True)
+                    self._park_orb()
+                else:
+                    self._toggle_orb_reveal()
+            else:
+                self._ensure_on_screen()
             self._save_geom()
             return
         self._drag = None
@@ -664,17 +726,32 @@ class HUD(tk.Tk):
         self._sync_footer_height(resizing=True)
 
     def _update_scale(self, w, h):
+        if self.__dict__.get("_shape") == "orb":
+            return
         scale_height = self.__dict__.get("_scale_height", h)
         self._scale = max(
             0.55, min(2.2, min(w / DEFAULT_W, scale_height / DEFAULT_H))
         )
-        for (_, pts, _), font in self._font_cache.items():
+        for key, font in self._font_cache.items():
+            if len(key) != 3:
+                continue
+            _, pts, _weight = key
             font.configure(size=max(7, int(pts * self._scale)))
         footer = self.__dict__.get("txt_footer")
         if footer is not None:
             offset = max(0, round(BASE_FONT * (self._scale - 1) / 8))
             footer.tag_config("brain", offset=offset * 2)
             footer.tag_config("lock", offset=offset * 3)
+
+    def _summary_font(self):
+        footer = self._font(False, BASE_FONT)
+        size = max(7, int(footer.cget("size")) - 2)
+        key = ("summary", size)
+        if key not in self._font_cache:
+            self._font_cache[key] = tkfont.Font(
+                family=footer.cget("family"), size=size, weight="bold",
+            )
+        return self._font_cache[key]
 
     def _font(self, mono: bool, pts: int, weight: str = "normal"):
         key = (mono, pts, weight)
@@ -757,6 +834,12 @@ class HUD(tk.Tk):
         self.after(UI_REFRESH_MS, self._poll)
 
     def _render(self, d):
+        self._latest = d
+        if self.__dict__.get("_shape") == "orb":
+            self._request_orb_frame()
+            if self._summary is not None:
+                self._show_summary()
+            return
         from view import render
         render(self, d)
 
@@ -768,12 +851,24 @@ class HUD(tk.Tk):
             text="📌" if self._topmost else "📍",
             fg=C["accent"] if self._topmost else C["dim"],
         )
+        if self.__dict__.get("_shape") == "orb":
+            self._orb_cache = None
+            self._request_orb_frame()
+            if self._summary is not None:
+                self._summary.attributes("-topmost", self._topmost)
+                self._present_summary(self._summary_opacity)
 
     def _toggle_alpha(self):
         self._alpha = ALPHA_LOW if self._alpha == ALPHA_NORMAL else ALPHA_NORMAL
-        self.attributes("-alpha", self._alpha)
+        if self.__dict__.get("_shape") == "orb":
+            self._orb_cache = None
+            self._request_orb_frame()
+        else:
+            self.attributes("-alpha", self._alpha)
 
     def _toggle_hide(self):
+        if self.__dict__.get("_shape") == "orb":
+            self._stop_orb()
         self._restore_borderless = True
         # Tk reliably applies override-redirect changes while withdrawn.
         self.withdraw()
@@ -789,12 +884,18 @@ class HUD(tk.Tk):
         ):
             self._restore_borderless = False
             self.after_idle(self._restore_borderless_window)
+        elif e.widget is self and self.__dict__.get("_shape") == "orb":
+            self._orb_cache = None
+            self._request_orb_frame()
 
     def _restore_borderless_window(self):
         self.withdraw()
         self.overrideredirect(True)
         self.deiconify()
         self.attributes("-topmost", self._topmost)
+        if self.__dict__.get("_shape") == "orb":
+            self._orb_cache = None
+            self._request_orb_frame()
 
     def _menu(self, e):
         m = tk.Menu(
@@ -805,29 +906,53 @@ class HUD(tk.Tk):
             activebackground=C["border"],
             activeforeground=C["accent"],
         )
-        m.add_command(label="置顶/取消置顶 (Ctrl+T)", command=self._toggle_topmost)
-        m.add_command(label="透明度切换 (Ctrl+A)", command=self._toggle_alpha)
+        m.add_command(label=self._t("topmost"), command=self._toggle_topmost)
+        m.add_command(label=self._t("opacity"), command=self._toggle_alpha)
+        m.add_command(
+            label=self._t("rect" if self.__dict__.get("_shape") == "orb" else "orb"),
+            command=self._toggle_shape,
+        )
+        if self.__dict__.get("_shape") == "orb":
+            m.add_command(
+                label=self._t("motion_off" if self._orb_motion_enabled else "motion_on"),
+                command=self._toggle_orb_motion,
+            )
         theme_menu = tk.Menu(m, tearoff=0)
         self._theme_var = tk.StringVar(value=self._theme_name)
-        for name, label in (("dark", "深色"), ("white", "白色"), ("paper", "纸质米色")):
+        for name in ("dark", "white", "paper"):
             theme_menu.add_radiobutton(
-                label=label,
-                value=name,
-                variable=self._theme_var,
+                label=self._t(name), value=name, variable=self._theme_var,
                 command=lambda n=name: self._set_theme(n),
             )
-        m.add_cascade(label="主题", menu=theme_menu)
+        m.add_cascade(label=self._t("theme"), menu=theme_menu)
+        language_menu = tk.Menu(m, tearoff=0)
+        self._language_var = tk.StringVar(value=self._language)
+        for language in LANGUAGES:
+            language_menu.add_radiobutton(
+                label=LANGUAGE_NAMES[language], value=language,
+                variable=self._language_var,
+                command=lambda n=language: self._set_language(n),
+            )
+        m.add_cascade(label=self._t("language"), menu=language_menu)
         m.add_separator()
-        m.add_command(label="最小化 (Ctrl+H)", command=self._toggle_hide)
-        m.add_command(label="重置大小位置", command=self._reset_geom)
+        m.add_command(label=self._t("minimize"), command=self._toggle_hide)
+        m.add_command(label=self._t("reset"), command=self._reset_geom)
         m.add_separator()
-        m.add_command(label="退出 (Ctrl+Q)", command=self._quit)
+        m.add_command(label=self._t("quit"), command=self._quit)
         try:
             m.tk_popup(e.x_root, e.y_root)
         finally:
             m.grab_release()
 
     def _reset_geom(self):
+        if self.__dict__.get("_shape") == "orb":
+            self._dock_edge = None
+            self._orb_revealed = False
+            size = self._orb_size
+            self.geometry(f"{size}x{size}+120+80")
+            self._hide_summary(force=True)
+            self._save_geom()
+            return
         self._scale_height = DEFAULT_H
         self.geometry(f"{DEFAULT_W}x{DEFAULT_H}+120+80")
         self._update_scale(DEFAULT_W, DEFAULT_H)
@@ -839,9 +964,50 @@ class HUD(tk.Tk):
     def _save_geom(self):
         try:
             with open(CFG_FILE, "w") as f:
-                json.dump({"g": self.geometry(), "theme": self._theme_name}, f)
+                json.dump(
+                    {
+                        "g": self.__dict__.get("_rect_geometry") or self.geometry(),
+                        "theme": self._theme_name,
+                        "shape": self.__dict__.get("_shape", "rect"),
+                        "dock": self.__dict__.get("_dock_edge"),
+                        "revealed": self.__dict__.get("_orb_revealed", False),
+                        "orb_motion": self.__dict__.get("_orb_motion_enabled", True),
+                        "language": self.__dict__.get("_language", "zh"),
+                    },
+                    f,
+                )
         except OSError:
             pass
+
+    def _t(self, key):
+        return translate(self.__dict__.get("_language", "zh"), key)
+
+    def _load_language(self):
+        try:
+            with open(CFG_FILE, encoding="utf-8") as f:
+                language = json.load(f).get("language", "zh")
+            return language if language in LANGUAGES else "zh"
+        except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+            return "zh"
+
+    def _set_language(self, language):
+        if language not in LANGUAGES or language == self._language:
+            return
+        self._language = language
+        self._apply_language()
+        if self.__dict__.get("_shape") == "orb" and self._summary is not None:
+            self._show_summary()
+        self._save_geom()
+
+    def _apply_language(self):
+        self.lbl_title.config(text=f"● {self._t('title')}")
+        if self.__dict__.get("_latest"):
+            self._render(self._latest)
+        else:
+            self.lbl_status.config(text=self._t("offline"))
+            self.lbl_cmd.config(text=self._t("idle_command"))
+        if hasattr(self, "col"):
+            self._update_session_label()
 
     def _load_theme_name(self):
         try:
@@ -859,11 +1025,15 @@ class HUD(tk.Tk):
         if self._theme_var is not None:
             self._theme_var.set(name)
         self._apply_theme()
+        if self.__dict__.get("_shape") == "orb":
+            self._draw_orb()
+            if self._summary is not None:
+                self._show_summary()
         self._save_geom()
 
     def _apply_theme(self):
-        for widget, option, value in (
-            (self, "bg", C["bg"]), (self._tbar, "bg", C["title"]),
+        widgets = [
+            (self._tbar, "bg", C["title"]),
             (self._body, "bg", C["bg"]), (self._footer, "bg", C["title"]),
             (self._status_row, "bg", C["bg"]),
             (self._status_group, "bg", C["bg"]),
@@ -880,7 +1050,10 @@ class HUD(tk.Tk):
             (self.lbl_cmd, "bg", C["bg"]), (self.lbl_cmd, "fg", C["text"]),
             (self.txt_footer, "bg", C["title"]), (self.txt_footer, "fg", C["text"]),
             (self.lbl_time, "bg", C["bg"]), (self.lbl_time, "fg", C["dim"]),
-        ):
+        ]
+        if self.__dict__.get("_shape") != "orb":
+            widgets.insert(0, (self, "bg", C["bg"]))
+        for widget, option, value in widgets:
             widget.configure(**{option: value})
         for tag, color in (
             ("brain", "dim"), ("prov", "accent"), ("lock", "accent"),
@@ -892,7 +1065,7 @@ class HUD(tk.Tk):
 
 
     def _ensure_on_screen(self):
-        if self._drag is not None:
+        if self._drag is not None or self.__dict__.get("_shape") == "orb":
             return
         try:
             if self.state() != "normal":
@@ -910,7 +1083,17 @@ class HUD(tk.Tk):
     def _load_geom(self):
         try:
             with open(CFG_FILE, encoding="utf-8") as f:
-                value = json.load(f).get("g")
+                saved = json.load(f)
+            if not isinstance(saved, dict):
+                return
+            shape = saved.get("shape", "rect")
+            self._shape = shape if shape in ("rect", "orb") else "rect"
+            self._dock_edge = saved.get("dock") if saved.get("dock") in ("left", "right", "top", "bottom") else None
+            self._orb_revealed = bool(saved.get("revealed"))
+            self._orb_motion_enabled = saved.get("orb_motion") is not False
+            language = saved.get("language", self.__dict__.get("_language", "zh"))
+            self._language = language if language in LANGUAGES else "zh"
+            value = saved.get("g")
             if not isinstance(value, str):
                 return
             match = re.fullmatch(r"(\d+)x(\d+)((?:[+-]-?\d+){0,2})", value)
@@ -928,9 +1111,289 @@ class HUD(tk.Tk):
                         for part in parts
                     )
             x, y = _safe_window_position(self, width, height, x, y)
-            self.geometry(f"{width}x{height}+{x}+{y}")
+            self._rect_geometry = f"{width}x{height}+{x}+{y}"
+            self.geometry(self._rect_geometry)
         except (OSError, json.JSONDecodeError, AttributeError, TypeError, ValueError, tk.TclError):
             pass
+
+    def _toggle_shape(self):
+        if self.__dict__.get("_shape") == "orb":
+            self._leave_orb()
+        else:
+            self._rect_geometry = self.geometry()
+            self._enter_orb()
+        self._save_geom()
+
+    def _enter_orb(self, save=True):
+        self._shape = "orb"
+        self._rect_geometry = self._rect_geometry or self.geometry()
+        for widget in (self._tbar, self._body, self._footer):
+            widget.pack_forget()
+        self._set_bell(False, C["dim"])
+        self._orb_size = physical_size(self)
+        self._orb_motion = OrbMotion()
+        self._orb_hovered = False
+        size = self._orb_size
+        self.minsize(1, 1)
+        self.maxsize(10000, 10000)
+        self.minsize(size, size)
+        self.maxsize(size, size)
+        self.geometry(f"{size}x{size}+{self.winfo_x()}+{self.winfo_y()}")
+        self._build_orb()
+        self.update_idletasks()
+        self._park_orb(save=save)
+
+    def _leave_orb(self):
+        self._shape = "rect"
+        self._dock_edge = None
+        self._orb_revealed = False
+        self._stop_orb()
+        if self._orb_canvas is not None:
+            self._orb_canvas.destroy()
+            self._orb_canvas = None
+        self.attributes("-transparentcolor", "")
+        self.attributes("-alpha", self._alpha)
+        self.minsize(1, 1)
+        self.maxsize(10000, 10000)
+        self.configure(bg=C["bg"])
+        self._tbar.pack(fill="x")
+        self._body.pack(fill="both", expand=True, padx=14, pady=0)
+        self._footer.pack(fill="x", side="bottom")
+        self.geometry(self._rect_geometry or f"{DEFAULT_W}x{DEFAULT_H}+120+80")
+        self._rect_geometry = None
+        self.update_idletasks()
+        self._update_scale(self.winfo_width(), self.winfo_height())
+        self._apply_fonts()
+        self._set_min_size()
+        self._render(self._latest)
+
+    def _build_orb(self):
+        if self._orb_canvas is not None:
+            return
+        from orb import CHROME
+
+        self.configure(bg=CHROME)
+        # Native alpha owns pixels in orb mode; Tk -alpha would disable it.
+        self.attributes("-alpha", 1.0)
+        self.attributes("-transparentcolor", "" if _user32 is not None else CHROME)
+        image = tk.Label(self, bg=CHROME, bd=0, highlightthickness=0)
+        image.pack(fill="both", expand=True)
+        self._orb_canvas = image
+        self._orb_photo = None
+        self._orb_cache = None
+
+    def _park_orb(self, save=True):
+        rectangle = self._current_screen_rectangle()
+        if rectangle is None:
+            return
+        current = (self.winfo_x(), self.winfo_y(), self.winfo_width(), self.winfo_height())
+        edge = dock_edge(*current, (rectangle,))
+        if edge is None:
+            self._dock_edge = None
+            self._orb_revealed = False
+            x, y = current[:2]
+        else:
+            self._dock_edge = edge[0]
+            x, y, _width, _height = docked_geometry(
+                edge[0], rectangle, size=self._orb_size,
+                revealed=self._orb_revealed, anchor=current[:2],
+            )
+        size = self._orb_size
+        self.minsize(size, size)
+        self.maxsize(size, size)
+        self.geometry(f"{size}x{size}+{int(x)}+{int(y)}")
+        self._request_orb_frame()
+        if save:
+            self._save_geom()
+
+    def _toggle_orb_reveal(self):
+        if self._dock_edge is None:
+            return
+        self._orb_revealed = not self._orb_revealed
+        self._park_orb()
+
+    def _current_screen_rectangle(self):
+        x, y = self.winfo_x(), self.winfo_y()
+        rectangles = _screen_rectangles(self)
+        for rectangle in rectangles:
+            left, top, right, bottom = rectangle
+            if left <= x < right and top <= y < bottom:
+                return rectangle
+        return rectangles[0] if rectangles else None
+
+    def _request_orb_frame(self):
+        if self._orb_canvas is not None and self._orb_after is None:
+            self._orb_after = self.after(0, self._advance_orb)
+
+    def _draw_orb(self):
+        if self._orb_canvas is None or self.state() != "normal":
+            return
+        from orb import clamp_percent, orb_state, render_orb
+
+        tokens = self._latest.get("tokens")
+        tokens = tokens if isinstance(tokens, dict) else {}
+        state = orb_state(self._latest)
+        color = {"running": "#22d6ff", "thinking": "#ad6bff"}.get(state, C["dim"])
+        frame = self._orb_motion.sample(
+            time.monotonic(), state, color, self._orb_hovered,
+            self._drag is not None, reduced=not self._orb_motion_enabled,
+        )
+        values = (clamp_percent(tokens.get("ctx_pct")), clamp_percent(tokens.get("hit_rate")))
+        motion = (round(frame.pulse, 3), round(frame.hover, 3), round(frame.press, 3))
+        key = (C["bg"], frame.color, state, values, self._orb_size, motion, self._alpha)
+        if self._orb_cache != key:
+            self._orb_rendered = render_orb(C["bg"], frame.color, *values, C, self._orb_size,
+                                           tint=motion[0], hover=motion[1], pressed=motion[2], state=state)
+            if _user32 is not None:
+                from layered import LayeredWindow
+                if self._orb_layer is None:
+                    self._orb_layer = LayeredWindow(self)
+                self._orb_layer.present(self._orb_rendered, self._alpha)
+            else:
+                from PIL import Image, ImageTk
+                from orb import CHROME
+                # Non-Windows Tk has no equivalent native per-pixel presenter.
+                image = Image.new("RGB", self._orb_rendered.size, CHROME)
+                image.paste(self._orb_rendered, mask=self._orb_rendered.getchannel("A").point(lambda a: 255 if a >= 128 else 0))
+                self._orb_photo = ImageTk.PhotoImage(image, master=self)
+                self._orb_canvas.configure(image=self._orb_photo)
+            self._orb_cache = key
+        if self._orb_after is None and frame.animate:
+            self._orb_after = self.after(33, self._advance_orb)
+
+    def _advance_orb(self):
+        self._orb_after = None
+        if self.__dict__.get("_shape") == "orb":
+            self._draw_orb()
+
+    def _toggle_orb_motion(self):
+        self._orb_motion_enabled = not self._orb_motion_enabled
+        if self._orb_after is not None:
+            self.after_cancel(self._orb_after)
+            self._orb_after = None
+        if not self._orb_motion_enabled and self._summary is not None:
+            if self._summary_fade_after is not None:
+                self.after_cancel(self._summary_fade_after)
+                self._summary_fade_after = None
+            self._present_summary(1.0)
+        self._request_orb_frame()
+        self._save_geom()
+
+    def _stop_orb(self):
+        if self._orb_after is not None:
+            self.after_cancel(self._orb_after)
+            self._orb_after = None
+        self._orb_hovered = self._pointer_inside = False
+        if self.__dict__.get("_orb_layer") is not None:
+            self._orb_layer.close()
+            self._orb_layer = None
+        self._orb_cache = None
+        self._hide_summary(force=True)
+
+    def _schedule_summary(self):
+        if self._summary_after is None and self._summary is None:
+            self._summary_after = self.after(180, self._show_summary)
+
+    def _show_summary(self):
+        if self.__dict__.get("_shape") != "orb" or self._drag is not None or not self._pointer_inside:
+            return
+        if self._summary_after is not None:
+            self.after_cancel(self._summary_after)
+            self._summary_after = None
+        from orb import CHROME, popup_geometry, render_summary
+
+        rectangle = self._current_screen_rectangle()
+        if rectangle is None:
+            return
+        pixels = max(10, round(int(self._summary_font().cget("size")) * float(self.tk.call("tk", "scaling"))))
+        summary_data = dict(self._latest) if isinstance(self._latest, dict) else {}
+        summary_data["language"] = self._language
+        self._summary_rendered = render_summary(summary_data, pixels)
+        width, height = self._summary_rendered.size
+        entering = self._summary is None
+        if entering:
+            popup = tk.Toplevel(self)
+            popup.withdraw()
+            popup.overrideredirect(True)
+            popup.attributes("-topmost", self._topmost)
+            popup.configure(bg=CHROME)
+            label = tk.Label(popup, bg=CHROME, bd=0, highlightthickness=0)
+            label.pack(fill="both", expand=True)
+            popup.bind("<Enter>", lambda _event: self._cancel_summary_hide())
+            popup.bind("<Leave>", lambda _event: self._queue_summary_hide())
+            self._summary = popup
+            self._summary_label = label
+            self._summary_opacity = 0.0 if self._orb_motion_enabled else 1.0
+        x, y, _width, _height = popup_geometry(
+            self._dock_edge,
+            (self.winfo_x(), self.winfo_y(), self._orb_size, self._orb_size),
+            width, height, rectangle,
+        )
+        self._summary.geometry(f"{width}x{height}+{x}+{y}")
+        self._summary.update_idletasks()
+        self._present_summary(self._summary_opacity)
+        if entering:
+            self._summary.deiconify()
+            self._summary_fade_start = time.monotonic()
+            self._fade_summary()
+
+    def _present_summary(self, opacity):
+        self._summary_opacity = opacity
+        if _user32 is not None:
+            from layered import LayeredWindow
+            if self._summary_layer is None:
+                self._summary_layer = LayeredWindow(self._summary)
+            self._summary_layer.present(self._summary_rendered, opacity)
+        else:
+            from PIL import Image, ImageTk
+            from orb import CHROME
+            image = Image.new("RGB", self._summary_rendered.size, CHROME)
+            image.paste(self._summary_rendered, mask=self._summary_rendered.getchannel("A").point(lambda a: 255 if a >= 128 else 0))
+            self._summary_photo = ImageTk.PhotoImage(image, master=self)
+            self._summary_label.configure(image=self._summary_photo)
+            self._summary.attributes("-transparentcolor", CHROME)
+            self._summary.attributes("-alpha", .71 * opacity)
+
+    def _fade_summary(self):
+        self._summary_fade_after = None
+        if self._summary is None:
+            return
+        progress = min(1.0, (time.monotonic() - self._summary_fade_start) / .16)
+        if not self._orb_motion_enabled:
+            progress = 1.0
+        self._present_summary(1 - (1 - progress) ** 3)
+        if progress < 1:
+            self._summary_fade_after = self.after(16, self._fade_summary)
+
+    def _queue_summary_hide(self):
+        self._pointer_inside = False
+        if self._summary_after is not None:
+            self.after_cancel(self._summary_after)
+            self._summary_after = None
+        self._summary_after = self.after(220, self._hide_summary)
+
+    def _cancel_summary_hide(self):
+        self._pointer_inside = True
+        if self._summary_after is not None:
+            self.after_cancel(self._summary_after)
+            self._summary_after = None
+
+    def _hide_summary(self, force=False):
+        if self._summary_after is not None:
+            self.after_cancel(self._summary_after)
+            self._summary_after = None
+        if self._pointer_inside and not force:
+            return
+        if self._summary_fade_after is not None:
+            self.after_cancel(self._summary_fade_after)
+            self._summary_fade_after = None
+        if self.__dict__.get("_summary_layer") is not None:
+            self._summary_layer.close()
+            self._summary_layer = None
+        if self._summary is not None:
+            self._summary.destroy()
+            self._summary = None
+            self._summary_label = None
 
     # ── Session switching ──
     def _get_sessions(self):
@@ -990,8 +1453,15 @@ class HUD(tk.Tk):
         self.col.switch_to(pool[self._session_idx])
         self._update_session_label()
 
+    def _on_pointer_leave(self, event):
+        if self.__dict__.get("_shape") != "orb" or event.widget not in (self, self._orb_canvas):
+            return
+        self._orb_hovered = False
+        self._request_orb_frame()
+        self._queue_summary_hide()
+
     def _on_config(self, e):
-        if e.widget is not self:
+        if e.widget is not self or self.__dict__.get("_shape") == "orb":
             return
         w, h = e.width, e.height
         if (
@@ -1020,7 +1490,7 @@ class HUD(tk.Tk):
             pass
 
     def _sync_footer_height(self, resizing=False):
-        if self._footer_syncing or (self._drag is not None and not resizing):
+        if self.__dict__.get("_shape") == "orb" or self._footer_syncing or (self._drag is not None and not resizing):
             return
         self._footer_syncing = True
         try:
@@ -1052,6 +1522,10 @@ class HUD(tk.Tk):
         return TITLE_H + body_height + 10 + footer_height
 
     def _set_min_size(self):
+        if self.__dict__.get("_shape") == "orb":
+            self.minsize(self._orb_size, self._orb_size)
+            self.maxsize(self._orb_size, self._orb_size)
+            return
         try:
             self.update_idletasks()
             min_height = max(MIN_H, self._content_min_height())
@@ -1071,6 +1545,7 @@ class HUD(tk.Tk):
 
     def _quit(self):
         self._save_geom()
+        self._stop_orb()
         with suppress(Exception):
             self.col.stop()  # type: ignore[union-attr]
         with suppress(Exception):

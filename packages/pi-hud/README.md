@@ -34,6 +34,8 @@ After installation, restart Pi. The monitor window appears in the top-left corne
 - **Responsive layout** — footer switches between one and two rows; horizontal resizing preserves the current UI scale, while vertical resizing keeps status and command content centered
 - **Context visibility** — resolves the active model's context window from Pi's custom and built-in model catalogs
 - **Task activity** — shows a colored, enlarged, shaking bell while Pi is running
+- **Circular dock** — right-click to switch to a compact Pi-logo circle; it stays where dropped and parks halfway off-screen only when released near an edge
+- **Bilingual UI** — switches between Chinese and English from the right-click menu; the preference is persisted
 - **Subagent cost** — keeps Pi's session total aligned with the native footer and shows recognized subagent-tool cost as a separate breakdown
 
 ## Shortcuts
@@ -41,6 +43,7 @@ After installation, restart Pi. The monitor window appears in the top-left corne
 | Shortcut | Action |
 | ---------- | -------- |
 | Drag title bar | Move window |
+| Right-click | Open actions; switch between rectangle and circle |
 | Drag edges / corners | Resize; horizontal dragging preserves the current UI scale |
 | ◀ / `Ctrl+[` | Previous session |
 | ▶ / `Ctrl+]` | Next session |
@@ -119,7 +122,26 @@ Automatic mapping is provider-scoped and uses the actual provider/model from the
 
 ## Themes
 
-Right-click the monitor and open **theme** to choose **Dark**, **White**, or **Paper Beige**. The selection is saved with the window geometry and restored on the next launch.
+Right-click the monitor and open **Theme** to choose **Dark**, **White**, or **Paper Beige**. Open **Language / 语言** to switch between English and Chinese. The same menu switches between the rectangular monitor and the circular dock. Theme, language, shape and geometry preferences are saved and restored on the next launch.
+
+The compact 50-point circle is divided into three visual layers: enlarged Pi logo, inner cache ring, and outer context ring. The context ring is the outermost layer. The rings are intentionally bold and close to the center, while the outer silhouette remains a clean circle. Window, image and docking geometry share the same DPI-scaled pixel size, so the circle is never cropped. Interior artwork is rendered at 6× resolution with native per-pixel alpha on Windows.
+
+Two bold, closely spaced rings with rounded ends show progress against fixed thirds of capacity:
+
+- **Outer — context**, a cool ramp of cyan → blue → purple
+- **Inner — cache hit**, a warm ramp of green → amber → red
+
+Each stage is mostly solid, with a short continuous gradient at its boundary. The rings and outer shell never breathe, rotate or change color with agent state.
+
+Only the center light breathes brighter: purple for **THINKING**, cyan for **RUNNING**, and still for **IDLE**. The logo area has no extra status label. Hover adds an eased highlight; pressing gently dims the inset material. Static layers are cached independently of animation, with a 33ms frame timer only while active or settling. Right-click **motion_off** to disable breathing and transitions; this preference is saved.
+
+It remains free-floating until its edge meets a screen edge, where it parks halfway off-screen; clicking the parked circle reveals or hides its full face. Hovering fades in a smaller, translucent rounded frosted summary with bold dark text beside the circle, without the current command. Both the orb and summary use antialiased per-pixel alpha on Windows to avoid jagged color-key edges. Minimizing or returning to the rectangle cancels orb animation and popup timers.
+
+The frosted finish is locally rendered material, not native desktop backdrop blur. It never captures desktop content. On Windows, the orb and summary use a small native per-pixel alpha presenter; other platforms use the Tk color-key fallback. True desktop backdrop blur is intentionally not used.
+
+![Orb themes and states](assets/orb-preview.png)
+
+![Orb motion preview](assets/orb-motion.gif)
 
 ![Dark](assets/dark.png)
 

@@ -1,9 +1,11 @@
 """HUD presentation: command/status center and footer rendering."""
 
 from data import fmt_money as _fmt_money, fmt_tokens as _fmt_tokens
+from i18n import translate
 from theme import C
 
 def render(self, d):
+    t = self._t
     cmd = d.get("command", "")
     tool = d.get("tool", "")
     tokens = d.get("tokens", {})
@@ -15,19 +17,19 @@ def render(self, d):
     is_active = bool(d.get("agent_active", False))
     if is_active and cmd:
         status_color = C["cyan"]
-        self.lbl_status.config(text="RUNNING", fg=status_color)
+        self.lbl_status.config(text=t("running"), fg=status_color)
         txt = f"▶ {tool}: {cmd}" if tool else cmd
         if len(txt) > 120:
             txt = txt[:117] + "…"
         self.lbl_cmd.config(text=txt)
     elif is_active:
         status_color = C["purple"]
-        self.lbl_status.config(text="THINKING", fg=status_color)
-        self.lbl_cmd.config(text="(generating…)")
+        self.lbl_status.config(text=t("thinking"), fg=status_color)
+        self.lbl_cmd.config(text=t("generating"))
     else:
         status_color = C["dim"]
-        self.lbl_status.config(text="IDLE", fg=status_color)
-        self.lbl_cmd.config(text="(idle)")
+        self.lbl_status.config(text=t("idle"), fg=status_color)
+        self.lbl_cmd.config(text=t("idle_command"))
     self._set_bell(is_active, status_color)
 
     # Footer 彩色分段
@@ -51,18 +53,19 @@ def render(self, d):
     hit_rate = tokens.get("hit_rate", 0.0)
     # In/Out (绿色)
     self.txt_footer.insert(
-        "end", f"In {_fmt_tokens(tin)}  Out {_fmt_tokens(tout)}", "tokens"
+        "end", f"{t('input')} {_fmt_tokens(tin)}  {t('output')} {_fmt_tokens(tout)}", "tokens"
     )
     self.txt_footer.insert("end", "  │  ", "sep")
     # 缓存命中率 (黄色)
-    self.txt_footer.insert("end", f"HitCache {hit_rate:.1f}%", "cache")
+    self.txt_footer.insert("end", f"{t('cache')} {hit_rate:.1f}%", "cache")
     self.txt_footer.insert("end", "  │  ", "sep")
     # 上下文占用 (蓝色)
-    self.txt_footer.insert("end", f"Ctx {ctx_pct:.1f}%" if ctx_pct else "Ctx —", "ctx")
+    self.txt_footer.insert("end", f"{t('context')} {ctx_pct:.1f}%" if ctx_pct else f"{t('context')} —", "ctx")
     self.txt_footer.insert("end", "  │  ", "sep")
     # 费用 (橙色)
+    # Pi subagents cost remains a separate footer segment in both languages.
     self.txt_footer.insert(
-        "end", f"{_fmt_money(cost)} Pi  ·  {_fmt_money(subagents_cost)} subagents", "cost"
+        "end", f"{_fmt_money(cost)} {t('pi')}  ·  {_fmt_money(subagents_cost)} {t('subagents')}", "cost"
     )
     # 全选文字加上 body tag 预留下伸空间
     self.txt_footer.tag_add("body", "1.0", "end")
